@@ -1,0 +1,10 @@
+node_modules/
+dist/
+release/
+artifacts/
+.builder-cache/
+*.log
+.env
+.env.*
+*.graphproj
+Thumbs.db
