@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { compile, parsePlot } from '../math/engine.js'
+import { validView, equalAspect } from '../math/view.js'
 import { bindContextGesture } from '../interaction/contextGesture.js'
 import './Plot2D.css'
 
@@ -7,20 +8,7 @@ const DEFAULT_VIEW = { xmin: -10, xmax: 10, ymin: -6, ymax: 6 }
 const TAU = Math.PI * 2
 const MAX_SAMPLES = 2200
 
-function safeView(candidate) {
-  const value = candidate ?? DEFAULT_VIEW
-  const { xmin, xmax, ymin, ymax } = value
-  const width = xmax - xmin
-  const height = ymax - ymin
-  const scale = Math.max(1, Math.abs(xmin), Math.abs(xmax), Math.abs(ymin), Math.abs(ymax))
-  if (![xmin, xmax, ymin, ymax, width, height].every(Number.isFinite)
-    || width <= Math.max(1e-10, Number.EPSILON * scale * 32)
-    || height <= Math.max(1e-10, Number.EPSILON * scale * 32)
-    || width > 1e12 || height > 1e12 || scale > 1e12) {
-    return DEFAULT_VIEW
-  }
-  return value
-}
+function safeView(candidate) { return validView(candidate) ? candidate : DEFAULT_VIEW }
 
 function niceStep(target) {
   if (!Number.isFinite(target) || target <= 0) return 1
@@ -273,14 +261,16 @@ function drawLayer(ctx, entry, points, selected, width, height) {
   if (selected) {
     buildPath()
     ctx.strokeStyle = color
-    ctx.globalAlpha = 0.18
-    ctx.lineWidth = 9
+    ctx.globalAlpha = 0.18 * (entry.layer.opacity ?? 1)
+    ctx.lineWidth = (entry.layer.lineWidth || 2.3) + 6
     ctx.stroke()
     ctx.globalAlpha = 1
   }
   buildPath()
   ctx.strokeStyle = color
-  ctx.lineWidth = selected ? 3.2 : 2.3
+  ctx.lineWidth = entry.layer.lineWidth || 2.3
+  ctx.globalAlpha = entry.layer.opacity ?? 1
+  ctx.setLineDash(entry.layer.lineStyle === 'dashed' ? [ctx.lineWidth * 4, ctx.lineWidth * 2] : entry.layer.lineStyle === 'dotted' ? [0.01, ctx.lineWidth * 2.5] : [])
   ctx.stroke()
   ctx.restore()
   return segments
@@ -305,6 +295,7 @@ export default function Plot2D({
   onStatus,
   view,
   onViewChange,
+  onHistoryEnd, onSize, aspectLocked = false, boxZoom = false, onBoxComplete, probe,
   canvasRef,
   theme = 'light',
   coordinateSystem = 'cartesian',
@@ -317,7 +308,8 @@ export default function Plot2D({
   const [size, setSize] = useState({ width: 0, height: 0, dpr: 1 })
   const [internalView, setInternalView] = useState(DEFAULT_VIEW)
   const [cursor, setCursor] = useState(null)
-  const currentView = safeView(view ?? internalView)
+  const [selectionBox, setSelectionBox] = useState(null)
+  const currentView = useMemo(() => equalAspect(safeView(view ?? internalView), size, aspectLocked), [view, internalView, size, aspectLocked])
   const parsedLayers = useMemo(() => prepareLayers(layers), [layers])
   const dark = theme === 'dark' || theme?.mode === 'dark'
   const polarGrid = coordinateSystem === 'polar'
@@ -331,9 +323,9 @@ export default function Plot2D({
     else if (canvasRef && typeof canvasRef === 'object') canvasRef.current = node
   }, [canvasRef])
 
-  const changeView = useCallback((next) => {
+  const changeView = useCallback((next, options = {}) => {
     if (safeView(next) !== next) return
-    if (typeof onViewChange === 'function') onViewChange(next)
+    if (typeof onViewChange === 'function') onViewChange(next, options)
     else setInternalView(next)
   }, [onViewChange])
 
@@ -358,6 +350,8 @@ export default function Plot2D({
     }
   }, [])
 
+  useEffect(() => { onSize?.({ width: size.width, height: size.height }); }, [size.width, size.height, onSize])
+
   useEffect(() => {
     const canvas = localCanvasRef.current
     if (!canvas || !size.width || !size.height) return
@@ -377,7 +371,7 @@ export default function Plot2D({
     drawGrid(ctx, size.width, size.height, currentView, palette, polarGrid)
     const hitSegments = []
     for (const entry of parsedLayers) {
-      if (entry.layer.visible === false || entry.kind === 'error' || entry.kind === 'unsupported') continue
+      if (entry.layer.visible === false || entry.layer.opacity === 0 || entry.kind === 'error' || entry.kind === 'unsupported') continue
       const points = sampleLayer(entry, currentView, size.width, size.height, params)
       const segments = drawLayer(ctx, entry, points, entry.layer.id === selectedId, size.width, size.height)
       hitSegments.push({ id: entry.layer.id, segments, stale: entry.layer.stale })
@@ -412,16 +406,17 @@ export default function Plot2D({
 
   const reportCursor = useCallback((position) => {
     if (!position || !size.width || !size.height) return
-    if (hitLayer(position)?.stale) { setCursor(null); onStatus?.({ cursor: null }); return }
+    if (layers.some(layer => layer.visible && layer.stale && !parsePlot(layer.expression).kind?.endsWith('3d'))) { setCursor(null); onStatus?.({ cursor: null }); return }
     const x = currentView.xmin + position.px * (currentView.xmax - currentView.xmin) / size.width
     const y = currentView.ymax - position.py * (currentView.ymax - currentView.ymin) / size.height
     const next = { x, y }
     setCursor(next)
     onStatus?.({ cursor: { x, y } })
-  }, [currentView, size.width, size.height, onStatus, hitLayer])
+  }, [currentView, size.width, size.height, onStatus, layers])
 
   const handleWheel = (event) => {
     event.preventDefault()
+    onInteractionStart?.()
     const position = pointerPosition(event)
     if (!position || !size.width || !size.height) return
     const factor = Math.max(0.5, Math.min(2, Math.exp(event.deltaY * 0.0015)))
@@ -436,14 +431,16 @@ export default function Plot2D({
       xmax: anchorX + (1 - fx) * nextWidth,
       ymin: anchorY - (1 - fy) * nextHeight,
       ymax: anchorY + fy * nextHeight,
-    })
+    }, { group: '2d-wheel' })
   }
 
   const handlePointerDown = (event) => {
     if (event.button !== 0 && event.button !== 1) return
     const position = pointerPosition(event)
     if (!position) return
-    dragRef.current = { pointerId: event.pointerId, origin: position, view: currentView, moved: false }
+    onHistoryEnd?.()
+    dragRef.current = { pointerId: event.pointerId, origin: position, view: currentView, moved: false, box: event.button === 0 && (boxZoom || event.shiftKey) }
+    if (dragRef.current.box) setSelectionBox({ start: position, end: position })
     event.currentTarget.setPointerCapture?.(event.pointerId)
   }
 
@@ -457,6 +454,7 @@ export default function Plot2D({
     const dy = position.py - drag.origin.py
     if (Math.hypot(dx, dy) > 3) drag.moved = true
     if (!drag.moved) return
+    if (drag.box) { setSelectionBox({ start: drag.origin, end: { px: Math.max(0, Math.min(size.width, position.px)), py: Math.max(0, Math.min(size.height, position.py)) } }); return }
     const shiftX = dx * (drag.view.xmax - drag.view.xmin) / size.width
     const shiftY = dy * (drag.view.ymax - drag.view.ymin) / size.height
     changeView({
@@ -464,23 +462,45 @@ export default function Plot2D({
       xmax: drag.view.xmax - shiftX,
       ymin: drag.view.ymin + shiftY,
       ymax: drag.view.ymax + shiftY,
-    })
+    }, { group: '2d-drag', hold: true })
   }
 
-  const handlePointerUp = (event) => {
+  const finishDrag = (event, cancelled = false) => {
     const drag = dragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) return
-    if (!drag.moved && typeof onSelectLayer === 'function') {
-      const position = pointerPosition(event)
-      const best = hitLayer(position)
-      if (best) onSelectLayer(best.id)
-    }
+    if (!drag || (event.pointerId != null && drag.pointerId !== event.pointerId)) return
     dragRef.current = null
-    event.currentTarget.releasePointerCapture?.(event.pointerId)
+    if (!cancelled && drag.box && drag.moved) {
+      const end = pointerPosition(event)
+      if (end) {
+        end.px = Math.max(0, Math.min(size.width, end.px)); end.py = Math.max(0, Math.min(size.height, end.py))
+        if (Math.abs(end.px - drag.origin.px) >= 6 && Math.abs(end.py - drag.origin.py) >= 6) {
+          const a = worldPosition(drag.origin), b = worldPosition(end)
+          changeView({ xmin: Math.min(a.x, b.x), xmax: Math.max(a.x, b.x), ymin: Math.min(a.y, b.y), ymax: Math.max(a.y, b.y) })
+          onBoxComplete?.()
+          onStatus?.({ message: '已框选放大' })
+        }
+      }
+    } else if (!cancelled && !drag.moved && !drag.box) {
+      const best = hitLayer(pointerPosition(event))
+      if (best) onSelectLayer?.(best.id)
+    }
+    setSelectionBox(null)
+    onHistoryEnd?.()
+    if (event.currentTarget?.hasPointerCapture?.(drag.pointerId)) event.currentTarget.releasePointerCapture(drag.pointerId)
   }
+
+  const cancelRef = useRef(null)
+  cancelRef.current = () => finishDrag({}, true)
+  useEffect(() => {
+    const cancel = () => cancelRef.current?.()
+    window.addEventListener('blur', cancel)
+    return () => window.removeEventListener('blur', cancel)
+  }, [])
 
   const handleKeyDown = (event) => {
     const key = event.key
+    if (key === 'Escape') { finishDrag({}, true); onBoxComplete?.(); return }
+    if (event.altKey || event.ctrlKey || event.metaKey) return
     if (!['+', '=', '-', '_', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key)) return
     event.preventDefault()
     const spanX = currentView.xmax - currentView.xmin
@@ -489,21 +509,27 @@ export default function Plot2D({
       const factor = key === '+' || key === '=' ? 0.8 : 1.25
       const cx = (currentView.xmin + currentView.xmax) / 2
       const cy = (currentView.ymin + currentView.ymax) / 2
-      changeView({ xmin: cx - spanX * factor / 2, xmax: cx + spanX * factor / 2, ymin: cy - spanY * factor / 2, ymax: cy + spanY * factor / 2 })
+      changeView({ xmin: cx - spanX * factor / 2, xmax: cx + spanX * factor / 2, ymin: cy - spanY * factor / 2, ymax: cy + spanY * factor / 2 }, { group: '2d-keys' })
       return
     }
     const dx = key === 'ArrowLeft' ? -spanX * 0.1 : key === 'ArrowRight' ? spanX * 0.1 : 0
     const dy = key === 'ArrowDown' ? -spanY * 0.1 : key === 'ArrowUp' ? spanY * 0.1 : 0
-    changeView({ xmin: currentView.xmin + dx, xmax: currentView.xmax + dx, ymin: currentView.ymin + dy, ymax: currentView.ymax + dy })
+    changeView({ xmin: currentView.xmin + dx, xmax: currentView.xmax + dx, ymin: currentView.ymin + dy, ymax: currentView.ymax + dy }, { group: '2d-keys' })
   }
 
-  contextCallbackRef.current = { onInteractionStart, open: location => {
+  contextCallbackRef.current = { wheel: handleWheel, onInteractionStart, open: location => {
     const position = pointerPosition(location)
     if (!position || !size.width || !size.height) return
     const hit = hitLayer(position)
     onContextMenu?.({ ...location, source: '2d', layerId: hit?.id,
       point: worldPosition(position), anchorElement: localCanvasRef.current })
   } }
+  useEffect(() => {
+    const canvas = localCanvasRef.current;
+    const wheel = event => contextCallbackRef.current.wheel(event);
+    canvas.addEventListener('wheel', wheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', wheel);
+  }, [])
   useEffect(() => bindContextGesture(localCanvasRef.current, {
     onOpen: location => contextCallbackRef.current.open(location),
     onStart: () => contextCallbackRef.current.onInteractionStart?.(),
@@ -513,15 +539,14 @@ export default function Plot2D({
     <div className={`plot2d ${dark ? 'plot2d--dark' : ''}`} ref={wrapperRef}>
       <canvas
         ref={attachCanvas}
-        className="plot2d__canvas"
+        className={`plot2d__canvas ${boxZoom ? 'box-zoom' : ''}`} data-view={JSON.stringify(currentView)}
         role="img"
         aria-label="二维坐标画布。使用滚轮缩放，拖动画布平移，方向键移动视图。"
         tabIndex={0}
-        onWheel={handleWheel}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={() => { dragRef.current = null }}
+        onPointerUp={event => finishDrag(event)}
+        onPointerCancel={event => finishDrag(event, true)} onLostPointerCapture={event => finishDrag(event, true)}
         onPointerLeave={() => {
           if (!dragRef.current) {
             setCursor(null)
@@ -530,6 +555,8 @@ export default function Plot2D({
         }}
         onKeyDown={handleKeyDown}
       />
+      {selectionBox && <div className="plot2d__selection" style={{ left: Math.min(selectionBox.start.px, selectionBox.end.px), top: Math.min(selectionBox.start.py, selectionBox.end.py), width: Math.abs(selectionBox.end.px - selectionBox.start.px), height: Math.abs(selectionBox.end.py - selectionBox.start.py) }} />}
+      {probe?.valid && <span className="probe-marker" aria-hidden="true" style={{ left: (probe.point.x - currentView.xmin) * size.width / (currentView.xmax - currentView.xmin), top: (currentView.ymax - probe.point.y) * size.height / (currentView.ymax - currentView.ymin) }} />}
       {cursor && <div className="plot2d__coordinate" aria-hidden="true">x {cursor.x.toFixed(2)} <span>·</span> y {cursor.y.toFixed(2)}</div>}
     </div>
   )

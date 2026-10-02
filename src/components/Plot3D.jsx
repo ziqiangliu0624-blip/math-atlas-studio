@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { DEFAULT_BOX } from '../math/view.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { compile, parsePlot } from '../math/engine.js';
 import { bindContextGesture } from '../interaction/contextGesture.js';
@@ -126,18 +130,20 @@ function surfaceGeometry(formula, params, xDomain, yDomain) {
   return { geometry, clipped };
 }
 
-function curveObjects(formulas, params, color, layerId, tDomain, stale) {
+function curveObjects(formulas, params, color, layerId, tDomain, stale, style, size) {
   const fx = compile(formulas.x);
   const fy = compile(formulas.y);
   const fz = compile(formulas.z);
   const group = new THREE.Group();
-  const material = new THREE.LineBasicMaterial({ color });
+  const material = new LineMaterial({ color, linewidth: style.lineWidth || 2.3, transparent: true, opacity: style.opacity ?? 1, dashed: style.lineStyle !== 'solid', dashSize: style.lineStyle === 'dotted' ? 0.025 : 0.3, gapSize: style.lineStyle === 'dotted' ? 0.12 : 0.18 });
+  material.resolution.set(size.width, size.height);
   let points = [];
   let clipped = 0;
   const flush = () => {
     if (points.length < 2) { points = []; return; }
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const line = new THREE.Line(geometry, material);
+    const geometry = new LineGeometry().setPositions(points.flatMap(point => point.toArray()));
+    const line = new Line2(geometry, material);
+    line.computeLineDistances();
     line.userData.layerId = layerId;
     line.userData.stale = stale;
     group.add(line);
@@ -164,44 +170,39 @@ function curveObjects(formulas, params, color, layerId, tDomain, stale) {
   return { group, clipped };
 }
 
-function createGuides(theme) {
+function createGuides(theme, box = DEFAULT_BOX) {
   const dark = theme === 'dark';
   const group = new THREE.Group();
-  const grid = new THREE.GridHelper(12, 12,
-    dark ? 0x607489 : 0xa7b7c8, dark ? 0x344354 : 0xdce4ec);
-  grid.rotation.x = Math.PI / 2;
-  group.add(grid);
-  const x = new THREE.Vector3(1, 0, 0);
-  const y = new THREE.Vector3(0, 1, 0);
-  const z = new THREE.Vector3(0, 0, 1);
-  for (const [direction, color] of [[x, 0xea6572], [y, 0x28a98c], [z, 0x5f8df0]]) {
-    const geometry = new THREE.BufferGeometry().setFromPoints([
-      direction.clone().multiplyScalar(-6.3), direction.clone().multiplyScalar(6.3),
-    ]);
-    group.add(new THREE.Line(geometry, new THREE.LineBasicMaterial({ color })));
+  const [xmin, xmax] = box.x, [ymin, ymax] = box.y, [zmin, zmax] = box.z;
+  const neutral = dark ? 0x607489 : 0xa7b7c8;
+  const gridPoints = [];
+  const planeZ = Math.max(zmin, Math.min(zmax, 0));
+  for (let i = 0; i <= 12; i++) {
+    const x = xmin + (xmax - xmin) * i / 12, y = ymin + (ymax - ymin) * i / 12;
+    gridPoints.push(new THREE.Vector3(x, ymin, planeZ), new THREE.Vector3(x, ymax, planeZ),
+      new THREE.Vector3(xmin, y, planeZ), new THREE.Vector3(xmax, y, planeZ));
   }
-  const labels = [
-    ['X', new THREE.Vector3(6.65, 0, 0), 0xea6572],
-    ['Y', new THREE.Vector3(0, 6.65, 0), 0x28a98c],
-    ['Z', new THREE.Vector3(0, 0, 6.65), 0x5f8df0],
-  ];
-  for (const [label, position, color] of labels) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 64;
-    canvas.height = 64;
+  group.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(gridPoints), new THREE.LineBasicMaterial({ color: dark ? 0x344354 : 0xdce4ec })));
+  const shape = new THREE.BoxGeometry(xmax - xmin, ymax - ymin, zmax - zmin);
+  const edges = new THREE.EdgesGeometry(shape); shape.dispose();
+  const boundary = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: neutral, transparent: true, opacity: 0.4 }));
+  boundary.position.set((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2);
+  group.add(boundary);
+  const clamp = (pair) => Math.max(pair[0], Math.min(pair[1], 0));
+  const zero = [clamp(box.x), clamp(box.y), clamp(box.z)];
+  const colors = [0xea6572, 0x28a98c, 0x5f8df0];
+  ['x', 'y', 'z'].forEach((axis, index) => {
+    const a = [...zero], b = [...zero]; a[index] = box[axis][0]; b[index] = box[axis][1];
+    group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...a), new THREE.Vector3(...b)]), new THREE.LineBasicMaterial({ color: colors[index] })));
+    const canvas = document.createElement('canvas'); canvas.width = 256; canvas.height = 64;
     const context = canvas.getContext('2d');
-    context.clearRect(0, 0, 64, 64);
-    context.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
-    context.font = '700 42px system-ui';
-    context.textAlign = 'center';
-    context.textBaseline = 'middle';
-    context.fillText(label, 32, 34);
-    const texture = new THREE.CanvasTexture(canvas);
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true }));
-    sprite.position.copy(position);
-    sprite.scale.set(0.75, 0.75, 1);
-    group.add(sprite);
-  }
+    context.fillStyle = `#${colors[index].toString(16).padStart(6, '0')}`;
+    context.font = '600 32px system-ui'; context.textAlign = 'center'; context.textBaseline = 'middle';
+    context.fillText(`${axis.toUpperCase()} ${Number(box[axis][1].toPrecision(4))}`, 128, 32);
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }));
+    const position = [...b]; position[index] += (box[axis][1] - box[axis][0]) * 0.055;
+    sprite.position.set(...position); sprite.scale.set(2, 0.5, 1); group.add(sprite);
+  });
   return group;
 }
 
@@ -216,8 +217,10 @@ function disposeGuides(root) {
 
 /** Cartesian z-up canvas. The parent owns expressions, parameters and PNG export. */
 export default function Plot3D({ layers = [], params = {}, selectedId, onSelectLayer,
-  onStatus, canvasRef, theme = 'light', viewCommand, cameraState, onCameraChange, onContextMenu, onInteractionStart }) {
+  onStatus, canvasRef, theme = 'light', viewCommand, cameraState, onCameraChange, onContextMenu, onInteractionStart, box = DEFAULT_BOX, probe, onAvailabilityChange }) {
   const hostRef = useRef(null);
+  const markerRef = useRef(null);
+  const probeRef = useRef(probe); probeRef.current = probe;
   const runtimeRef = useRef(null);
   const callbackRef = useRef({ onSelectLayer, onStatus, onCameraChange, onContextMenu, onInteractionStart });
   const lastCommandRef = useRef(null);
@@ -225,6 +228,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
   const [error, setError] = useState('');
   const errorRef = useRef(error);
   errorRef.current = error;
+  useEffect(() => { onAvailabilityChange?.(!error); }, [error, onAvailabilityChange]);
   callbackRef.current = { onSelectLayer, onStatus, onCameraChange, onContextMenu, onInteractionStart };
 
   useEffect(() => {
@@ -283,11 +287,13 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     let lastReported = cameraSnapshot(camera, controls.target);
     let reportTimer = 0;
     let reportPending = false;
-    const emitCamera = () => {
+    let cameraGroup = '3d-wheel';
+    let gestureId = 0;
+    const emitCamera = (group = cameraGroup) => {
       const state = cameraSnapshot(camera, controls.target);
       if (sameCameraState(state, lastReported)) return;
       lastReported = state;
-      callbackRef.current.onCameraChange?.(state);
+      callbackRef.current.onCameraChange?.(state, false, group ? { group } : {});
     };
     const scheduleCameraReport = () => {
       reportPending = true;
@@ -317,7 +323,15 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         frame = 0;
         if (disposed) return;
         controls.update();
-        try { renderer.render(scene, camera); }
+        try {
+          renderer.render(scene, camera);
+          const pinned = probeRef.current, marker = markerRef.current;
+          if (marker) {
+            const point = pinned?.valid ? new THREE.Vector3(pinned.point.x, pinned.point.y, pinned.point.z).project(camera) : null;
+            marker.hidden = !point || point.z < -1 || point.z > 1 || Math.abs(point.x) > 1 || Math.abs(point.y) > 1;
+            if (point) { marker.style.left = `${(point.x + 1) * host.clientWidth / 2}px`; marker.style.top = `${(1 - point.y) * host.clientHeight / 2}px`; }
+          }
+        }
         catch {
           setError('3D 绘制已中断。请检查显卡驱动后重新打开应用。');
           callbackRef.current.onStatus?.({ message: '3D 绘制已中断' });
@@ -353,6 +367,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
 
     const raycaster = new THREE.Raycaster();
     raycaster.params.Line.threshold = 0.2;
+    raycaster.params.Line2 = { threshold: 7 };
     const pointer = new THREE.Vector2();
     const hit = (event) => {
       const rect = renderer.domElement.getBoundingClientRect();
@@ -361,12 +376,14 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       camera.updateMatrixWorld();
       scene.updateMatrixWorld(true);
       raycaster.setFromCamera(pointer, camera);
-      return raycaster.intersectObjects([...content.children].reverse(), true)[0];
+      const intersection = raycaster.intersectObjects([...content.children].reverse(), true)[0];
+      if (intersection?.pointOnLine) intersection.point = intersection.pointOnLine;
+      return intersection;
     };
     let down = null;
     let hoverFrame = 0;
     let lastHover = 0;
-    const pointerDown = (event) => { down = event.button === 0 ? { x: event.clientX, y: event.clientY, moved: false } : null; };
+    const pointerDown = (event) => { cameraGroup = `3d-drag:${++gestureId}`; down = event.button === 0 ? { x: event.clientX, y: event.clientY, moved: false } : null; };
     const pointerUp = (event) => {
       if (!down || down.moved || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) { down = null; return; }
       down = null;
@@ -388,6 +405,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         } : null });
       });
     };
+    const wheelGroup = () => { cameraGroup = '3d-wheel'; };
     const pointerLeave = () => callbackRef.current.onStatus?.({ cursor: null });
     const doubleClick = (event) => {
       const intersection = hit(event);
@@ -424,6 +442,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       callbackRef.current.onStatus?.({ message: '3D 显卡连接已恢复' });
       invalidate();
     };
+    renderer.domElement.addEventListener('wheel', wheelGroup, { capture: true, passive: true });
     renderer.domElement.addEventListener('pointerdown', pointerDown);
     renderer.domElement.addEventListener('pointerup', pointerUp);
     renderer.domElement.addEventListener('pointermove', pointerMove);
@@ -473,11 +492,12 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         cancelCameraReport();
         emitCamera();
       },
-      reportCamera() { cancelCameraReport(); emitCamera(); },
+      reportCamera() { cancelCameraReport(); emitCamera(null); },
       scheduleCameraReport,
       invalidate,
     };
     runtimeRef.current = runtime;
+    renderer.domElement.flushView = () => runtime.flushCameraReport();
     const initialCamera = validCameraState(cameraState);
     if (initialCamera) runtime.applyCameraState(initialCamera);
     else callbackRef.current.onCameraChange?.(runtime.snapshotCamera(), true);
@@ -496,6 +516,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       controls.removeEventListener('change', controlsChanged);
       controls.removeEventListener('end', scheduleCameraReport);
       controls.dispose();
+      renderer.domElement.removeEventListener('wheel', wheelGroup, true);
       renderer.domElement.removeEventListener('pointerdown', pointerDown);
       renderer.domElement.removeEventListener('pointerup', pointerUp);
       renderer.domElement.removeEventListener('pointermove', pointerMove);
@@ -527,10 +548,12 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     const runtime = runtimeRef.current;
     if (!runtime) return;
     disposeGuides(runtime.guideHolder);
-    runtime.guideHolder.add(createGuides(theme));
+    runtime.guideHolder.add(createGuides(theme, box));
     runtime.scene.background = new THREE.Color(theme === 'dark' ? 0x111820 : 0xfbfcfe);
     runtime.invalidate();
-  }, [theme]);
+  }, [theme, box]);
+
+  useEffect(() => { runtimeRef.current?.invalidate(); }, [probe]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -538,7 +561,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     disposeTree(runtime.content);
     const notices = [];
     for (const layer of layers) {
-      if (layer.visible === false) continue;
+      if (layer.visible === false || layer.opacity === 0) continue;
       let plot;
       try { plot = parsePlot(layer.expression || ''); }
       catch { continue; }
@@ -551,8 +574,8 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
           if (!geometry) { notices.push(`${layer.name || '曲面'}：当前绘制域内没有有效图形`); continue; }
           const material = new THREE.MeshPhongMaterial({
             color, vertexColors: true, side: THREE.DoubleSide, shininess: 45,
-            transparent: true, opacity: layer.id === selectedId ? 0.96 : 0.84,
-            depthWrite: true,
+            transparent: true, opacity: layer.opacity ?? 1,
+            depthWrite: (layer.opacity ?? 1) >= 0.95,
           });
           const mesh = new THREE.Mesh(geometry, material);
           mesh.userData.layerId = layer.id;
@@ -560,7 +583,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
           runtime.content.add(mesh);
         } else if (plot.kind === 'curve3d') {
           const { group, clipped } = curveObjects(plot.formulas, params, color, layer.id,
-            domainFor(layer, 't'), layer.stale);
+            domainFor(layer, 't'), layer.stale, layer, { width: hostRef.current.clientWidth, height: hostRef.current.clientHeight });
           if (clipped) notices.push(`${layer.name || '空间曲线'}：${clipped} 个无效或超出范围的采样点已跳过`);
           if (!group.children.length) notices.push(`${layer.name || '空间曲线'}：当前绘制域内没有有效图形`);
           runtime.content.add(group);
@@ -647,7 +670,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         const rect = event.currentTarget.getBoundingClientRect();
         onContextMenu?.({ source: '3d', available: false, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, anchorElement: event.currentTarget });
       }}>
-      <div className="plot3d__canvas" ref={hostRef} />
+      <div className="plot3d__canvas" ref={hostRef} /><span ref={markerRef} className="probe-marker" hidden aria-hidden="true" />
       {error && <div className="plot3d__fallback" role="alert">
         <div className="plot3d__fallback-icon" aria-hidden="true">◇</div>
         <strong>三维画布暂不可用</strong>

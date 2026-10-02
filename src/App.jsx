@@ -3,11 +3,13 @@ import Plot2D from './components/Plot2D.jsx';
 import Plot3D from './components/Plot3D.jsx';
 import ContextMenu from './components/ContextMenu.jsx';
 import LayerNameEditor from './components/LayerNameEditor.jsx';
+import ViewSettings from './components/ViewSettings.jsx';
+import { START_VIEW, DEFAULT_BOX, validView, equalAspect, normalizeStyle, normalizeBox, normalizeProbes, probeSignature } from './math/view.js';
+import { createHistory, recordHistory, finishGroup } from './interaction/history.js';
 import { compile, findParameters, parsePlot } from './math/engine.js';
 import { domainPair, normalizeDomain, withSurfaceAxis } from './math/domain.js';
 
 const COLORS = ['#5368d9', '#ef785b', '#16a6a0', '#a56ad9', '#e6a72e', '#467fb6'];
-const START_VIEW = { xmin: -10, xmax: 10, ymin: -6, ymax: 6 };
 const STORAGE_KEY = 'math-atlas-project-v1';
 const RECOVERY_KEY = 'math-atlas-recoveries-v1';
 
@@ -66,7 +68,7 @@ function makeLayer(partial, index = 0) {
     id: crypto.randomUUID(), name: partial.name || `图层 ${index + 1}`,
     expression: partial.expression || 'y = sin(x)',
     lastValidExpression: partial.expression || 'y = sin(x)',
-    color: partial.color || COLORS[index % COLORS.length], visible: true,
+    color: partial.color || COLORS[index % COLORS.length], visible: true, ...normalizeStyle(partial),
     domain: partial.domain || [-10, 10]
   };
 }
@@ -76,7 +78,7 @@ function projectFromExample(example) {
     schemaVersion: 1, name: example.title, exampleId: example.id,
     layers: example.layers.map((layer, index) => makeLayer(layer, index)),
     params: { ...example.params }, ranges: { ...example.ranges },
-    view2d: { ...example.view }, mode: example.mode,
+    view2d: { ...example.view }, aspectLocked: false, box3d: normalizeBox(), probes: {}, mode: example.mode,
     coordinateSystem: example.coordinateSystem || 'cartesian',
     createdAt: new Date().toISOString()
   };
@@ -99,7 +101,7 @@ function normalizeProject(data) {
       expression: layer.expression,
       lastValidExpression: typeof layer.lastValidExpression === 'string' ? layer.lastValidExpression : layer.expression,
       color: typeof layer.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(layer.color) ? layer.color : COLORS[index % COLORS.length],
-      visible: layer.visible !== false,
+      visible: layer.visible !== false, ...normalizeStyle(layer),
       domain
     };
   });
@@ -123,9 +125,7 @@ function normalizeProject(data) {
       }
     } catch { /* expression error is shown in the inspector */ }
   }
-  const candidateView = data.view2d;
-  const view2d = candidateView && ['xmin', 'xmax', 'ymin', 'ymax'].every(key => Number.isFinite(candidateView[key])) && candidateView.xmax > candidateView.xmin && candidateView.ymax > candidateView.ymin
-    ? candidateView : { ...START_VIEW };
+  const view2d = validView(data.view2d) ? data.view2d : { ...START_VIEW };
   const camera = data.camera3d;
   const camera3d = camera && ['perspective', 'orthographic'].includes(camera.projection) &&
     Array.isArray(camera.position) && camera.position.length === 3 && camera.position.every(Number.isFinite) &&
@@ -136,7 +136,8 @@ function normalizeProject(data) {
     schemaVersion: 1,
     name: typeof data.name === 'string' ? data.name.slice(0, 100) : '未命名工程',
     exampleId: typeof data.exampleId === 'string' ? data.exampleId : null,
-    layers, params, ranges, view2d,
+    layers, params, ranges, view2d, aspectLocked: data.aspectLocked === true,
+    box3d: normalizeBox(data.box3d), probes: normalizeProbes(data.probes, layers),
     mode: ['2d', '3d', 'split'].includes(data.mode) ? data.mode : '2d',
     coordinateSystem: data.coordinateSystem === 'polar' ? 'polar' : 'cartesian',
     createdAt: typeof data.createdAt === 'string' ? data.createdAt : new Date().toISOString(),
@@ -199,6 +200,9 @@ function Icon({ name, size = 18, strokeWidth = 1.8 }) {
     sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.5 1.5m11.2 11.2 1.5 1.5M19.1 4.9l-1.5 1.5M6.4 17.6l-1.5 1.5" /></>,
     layers: <><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5" /></>,
     chart: <><path d="M3 20V4m0 16h18M5 16c3-1 4-9 7-9s4 9 9 1" /></>,
+    lock: <><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" /></>,
+    back: <><path d="m14 6-6 6 6 6" /></>,
+    forward: <><path d="m10 6 6 6-6 6" /></>,
     cube: <><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Zm0 10 9-5m-9 5L3 7m9 5v10" /></>
   };
   return <svg {...common}>{paths[name] || paths.chart}</svg>;
@@ -208,7 +212,7 @@ function IconButton({ icon, label, onClick, disabled = false, active = false, cl
   return <button type="button" className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} disabled={disabled} title={label} aria-label={label}><Icon name={icon} /></button>;
 }
 
-function DomainRangeEditor({ label, id, range, onCommit, onInvalid, limit }) {
+function DomainRangeEditor({ label, id, range, onCommit, onInvalid, limit, disabled = false }) {
   const commitEdge = (edge, event) => {
     const input = event.currentTarget;
     const raw = input.value.trim();
@@ -223,8 +227,8 @@ function DomainRangeEditor({ label, id, range, onCommit, onInvalid, limit }) {
     if (value !== range[edge]) onCommit(next);
   };
   return <div className="domain-axis"><div className="domain-axis-title">{label}</div><div className="domain-controls">
-    <label>起点<input key={`${id}-min-${range[0]}`} type="number" defaultValue={range[0]} onBlur={event => commitEdge(0, event)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
-    <label>终点<input key={`${id}-max-${range[1]}`} type="number" defaultValue={range[1]} onBlur={event => commitEdge(1, event)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
+    <label>起点<input key={`${id}-min-${range[0]}`} type="number" disabled={disabled} defaultValue={range[0]} onBlur={event => commitEdge(0, event)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
+    <label>终点<input key={`${id}-max-${range[1]}`} type="number" disabled={disabled} defaultValue={range[1]} onBlur={event => commitEdge(1, event)} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
   </div></div>;
 }
 
@@ -289,16 +293,24 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState(null);
   const [renamingId, setRenamingId] = useState(null);
   const [activeView, setActiveView] = useState('2d');
+  const [showViewSettings, setShowViewSettings] = useState(false);
+  const [boxZoom, setBoxZoom] = useState(false);
+  const [threeAvailable, setThreeAvailable] = useState(true);
+  const [plotSize, setPlotSize] = useState({ width: 0, height: 0 });
+  const history = useRef(createHistory());
+  const navigation = useRef({ '2d': { past: [], future: [] }, '3d': { past: [], future: [] } });
   const projectRef = useRef(project);
   const selectedRef = useRef(selectedId);
   const contextRef = useRef(null);
   const plot2dRef = useRef(null);
   const plot3dRef = useRef(null);
   const importRef = useRef(null);
-  const past = useRef([]);
-  const future = useRef([]);
   const revisionRef = useRef(0);
+  const sliderHeld = useRef(false);
   const activeCanvas = project.mode === 'split' ? activeView : project.mode;
+  const displayedView = useMemo(() => equalAspect(project.view2d, plotSize, project.aspectLocked), [project.view2d, plotSize, project.aspectLocked]);
+  const endHistoryGroup = useCallback(() => finishGroup(history.current), []);
+  const flushView = useCallback(() => plot3dRef.current?.flushView?.(), []);
   const resolveView = useCallback(target => target === '2d' || target === '3d' ? target : activeCanvas, [activeCanvas]);
 
   const selectLayer = useCallback(id => {
@@ -322,6 +334,7 @@ export default function App() {
   }, [selectLayer]);
 
   useEffect(() => { closeContextMenu(); setRenamingId(null); }, [project.mode, closeContextMenu]);
+  useEffect(() => { setStatus({ message: `${activeCanvas.toUpperCase()} 画布已就绪` }); }, [activeCanvas]);
 
   const selectedLayer = project.layers.find(layer => layer.id === selectedId) || project.layers[0];
   const selectedValidation = selectedLayer ? readPlot(selectedLayer) : null;
@@ -362,43 +375,81 @@ export default function App() {
     notify.timer = window.setTimeout(() => setToast(''), 3600);
   }, []);
 
-  const commit = useCallback((updater, nextSelection = selectedRef.current) => {
+  const recordNavigation = useCallback((before, after, grouped = false) => {
+    for (const [target, key] of [['2d', 'view2d'], ['3d', 'camera3d']]) {
+      if (!before[key] || !after[key] || JSON.stringify(before[key]) === JSON.stringify(after[key])) continue;
+      const nav = navigation.current[target];
+      if (!grouped) nav.past = [...nav.past.slice(-39), before[key]];
+      nav.future = [];
+    }
+  }, []);
+
+  const commit = useCallback((updater, nextSelection = selectedRef.current, options = {}) => {
+    if (!options.fromCamera) flushView();
     const previous = projectRef.current;
     const next = typeof updater === 'function' ? updater(previous) : updater;
     if (next === previous) return;
-    // History mutations stay outside React updaters, which StrictMode may replay.
-    past.current = [...past.current.slice(-39), { project: previous, selectedId: selectedRef.current }];
-    future.current = [];
+    const newStep = recordHistory(history.current, { project: previous, selectedId: selectedRef.current }, options);
+    if (!options.skipNavigation) recordNavigation(previous, next, !newStep);
     revisionRef.current += 1;
     projectRef.current = next;
     setProject(next);
     selectLayer(nextSelection);
     setDirty(true);
-  }, [selectLayer]);
+  }, [selectLayer, flushView, recordNavigation]);
 
   const undo = useCallback(() => {
-    if (!past.current.length) return;
+    flushView(); endHistoryGroup();
+    if (!history.current.past.length) return;
     closeContextMenu(); setRenamingId(null);
-    future.current.push({ project: projectRef.current, selectedId: selectedRef.current });
-    const next = past.current.pop();
+    history.current.future.push({ project: projectRef.current, selectedId: selectedRef.current });
+    const next = history.current.past.pop();
+    recordNavigation(projectRef.current, next.project);
     projectRef.current = next.project;
     setProject(next.project);
     selectLayer(next.selectedId);
     revisionRef.current += 1;
-    setDirty(true);
-  }, [selectLayer, closeContextMenu]);
+    setDirty(true); notify('已撤销上一步操作');
+  }, [selectLayer, closeContextMenu, endHistoryGroup, flushView, recordNavigation, notify]);
 
   const redo = useCallback(() => {
-    if (!future.current.length) return;
+    flushView(); endHistoryGroup();
+    if (!history.current.future.length) return;
     closeContextMenu(); setRenamingId(null);
-    past.current.push({ project: projectRef.current, selectedId: selectedRef.current });
-    const next = future.current.pop();
+    history.current.past.push({ project: projectRef.current, selectedId: selectedRef.current });
+    const next = history.current.future.pop();
+    recordNavigation(projectRef.current, next.project);
     projectRef.current = next.project;
     setProject(next.project);
     selectLayer(next.selectedId);
     revisionRef.current += 1;
-    setDirty(true);
-  }, [selectLayer, closeContextMenu]);
+    setDirty(true); notify('已重做上一步操作');
+  }, [selectLayer, closeContextMenu, endHistoryGroup, flushView, recordNavigation, notify]);
+
+  const change2dView = useCallback((next, options = {}) => {
+    const adjusted = equalAspect(next, plotSize, projectRef.current.aspectLocked);
+    if (!validView(adjusted)) { notify('视图已到可用范围边界'); return; }
+    commit(previous => JSON.stringify(previous.view2d) === JSON.stringify(adjusted) ? previous : { ...previous, view2d: adjusted }, selectedRef.current, options);
+  }, [commit, plotSize, notify]);
+
+  const travelView = useCallback((direction, target) => {
+    flushView(); endHistoryGroup(); closeContextMenu();
+    const source = resolveView(target), key = source === '2d' ? 'view2d' : 'camera3d';
+    const nav = navigation.current[source];
+    const from = direction === 'back' ? nav.past : nav.future;
+    const to = direction === 'back' ? nav.future : nav.past;
+    if (!from.length) return;
+    const next = from.pop();
+    to.push(projectRef.current[key]);
+    commit(previous => ({ ...previous, [key]: next }), selectedRef.current, { skipNavigation: true });
+    notify(`已${direction === 'back' ? '返回上一' : '前进到下一'}${source.toUpperCase()}视图`);
+  }, [commit, resolveView, notify, flushView, endHistoryGroup, closeContextMenu]);
+
+  useEffect(() => {
+    const stop = () => endHistoryGroup();
+    window.addEventListener('blur', stop);
+    return () => window.removeEventListener('blur', stop);
+  }, [endHistoryGroup]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -433,10 +484,12 @@ export default function App() {
   }, [notify]);
 
   const switchProject = useCallback((next, path = null, isDirty = false) => {
-    if (dirty && !stashRecovery(project)) return false;
+    flushView(); endHistoryGroup();
+    if (dirty && !stashRecovery(projectRef.current)) return false;
     closeContextMenu(); setRenamingId(null);
-    past.current = [];
-    future.current = [];
+    history.current = createHistory();
+    navigation.current = { '2d': { past: [], future: [] }, '3d': { past: [], future: [] } };
+    setBoxZoom(false); setShowViewSettings(false);
     revisionRef.current += 1;
     projectRef.current = next;
     setProject(next);
@@ -444,7 +497,7 @@ export default function App() {
     setFilePath(path);
     setDirty(isDirty);
     return true;
-  }, [dirty, project, stashRecovery, closeContextMenu, selectLayer]);
+  }, [dirty, stashRecovery, closeContextMenu, selectLayer, flushView, endHistoryGroup]);
 
   const loadExample = useCallback(example => {
     const next = projectFromExample(example);
@@ -453,9 +506,10 @@ export default function App() {
     notify(`已打开「${example.title}」示例`);
   }, [switchProject, notify]);
 
-  const updateLayer = useCallback((id, changes) => {
+  const updateLayer = useCallback((id, changes, options = {}) => {
     commit(previous => {
       const original = previous.layers.find(layer => layer.id === id);
+      if (original?.locked && Object.keys(changes).some(key => !['locked', 'visible'].includes(key))) return previous;
       if (!original || Object.entries(changes).every(([key, value]) => original[key] === value)) return previous;
       const params = { ...previous.params };
       const ranges = { ...previous.ranges };
@@ -477,7 +531,7 @@ export default function App() {
       return next;
       });
       return { ...previous, exampleId: null, layers, params, ranges };
-    });
+    }, selectedRef.current, options);
   }, [commit]);
 
   const addLayer = useCallback(target => {
@@ -491,7 +545,7 @@ export default function App() {
   const removeLayer = useCallback(id => {
     const layers = projectRef.current.layers;
     const index = layers.findIndex(layer => layer.id === id);
-    if (index < 0) return;
+    if (index < 0 || layers[index].locked) return;
     const nextSelection = selectedRef.current === id ? (layers[index + 1] || layers[index - 1])?.id : selectedRef.current;
     commit(previous => ({ ...previous, exampleId: null, layers: previous.layers.filter(layer => layer.id !== id) }), nextSelection);
   }, [commit]);
@@ -501,7 +555,7 @@ export default function App() {
     const index = layers.findIndex(layer => layer.id === id);
     if (index < 0) return;
     if (layers.length >= 200) { notify('一个工程最多支持 200 个图层'); return; }
-    const copy = { ...structuredClone(layers[index]), id: crypto.randomUUID(), name: `${layers[index].name.slice(0, 96)} 副本` };
+    const copy = { ...structuredClone(layers[index]), id: crypto.randomUUID(), locked: false, name: `${layers[index].name.slice(0, 96)} 副本` };
     commit(previous => ({ ...previous, exampleId: null, layers: [...previous.layers.slice(0, index + 1), copy, ...previous.layers.slice(index + 1)] }), copy.id);
     notify('图层已复制；同名参数仍联动');
   }, [commit, notify]);
@@ -510,7 +564,7 @@ export default function App() {
     commit(previous => {
       const index = previous.layers.findIndex(layer => layer.id === id);
       const destination = index + direction;
-      if (index < 0 || destination < 0 || destination >= previous.layers.length) return previous;
+      if (index < 0 || destination < 0 || destination >= previous.layers.length || previous.layers[index].locked || previous.layers[destination].locked) return previous;
       const layers = [...previous.layers];
       [layers[index], layers[destination]] = [layers[destination], layers[index]];
       return { ...previous, exampleId: null, layers };
@@ -518,17 +572,19 @@ export default function App() {
   }, [commit]);
 
   const editLayer = useCallback(id => {
+    if (projectRef.current.layers.find(layer => layer.id === id)?.locked) { notify('请先解锁图层，再修改属性'); return; }
     selectLayer(id); setShowRight(true);
     window.requestAnimationFrame(() => { const input = document.getElementById('expression-input'); input?.focus(); input?.select(); });
-  }, [selectLayer]);
+  }, [selectLayer, notify]);
 
   const changeParameter = useCallback((key, value) => {
-    commit(previous => ({ ...previous, params: { ...previous.params, [key]: value } }));
+    commit(previous => previous.params[key] === value ? previous : ({ ...previous, params: { ...previous.params, [key]: value } }), selectedRef.current, { group: `parameter:${key}`, hold: sliderHeld.current });
   }, [commit]);
 
   const saveProject = useCallback(async (saveAs = false) => {
     try {
-      const snapshot = { ...project, savedAt: new Date().toISOString() };
+      flushView(); endHistoryGroup();
+      const snapshot = { ...projectRef.current, savedAt: new Date().toISOString() };
       const snapshotRevision = revisionRef.current;
       if (window.desktop) {
         const result = await window.desktop.saveProject(snapshot, saveAs ? null : filePath);
@@ -547,7 +603,7 @@ export default function App() {
         notify('工程已保存到本地');
       } else notify('已保存上一版本；当前改动仍未保存');
     } catch (error) { notify(`保存失败：${error.message}`); }
-  }, [project, filePath, notify]);
+  }, [project, filePath, notify, flushView, endHistoryGroup]);
 
   const openProject = useCallback(async () => {
     try {
@@ -600,25 +656,22 @@ export default function App() {
   }, [staleInView, resolveView, project.name, notify]);
 
   const zoom2d = useCallback(factor => {
-    commit(previous => {
-      const view = previous.view2d;
-      const cx = (view.xmin + view.xmax) / 2, cy = (view.ymin + view.ymax) / 2;
-      const width = (view.xmax - view.xmin) * factor / 2;
-      const height = (view.ymax - view.ymin) * factor / 2;
-      return { ...previous, view2d: { xmin: cx - width, xmax: cx + width, ymin: cy - height, ymax: cy + height } };
-    });
-  }, [commit]);
+    const view = equalAspect(projectRef.current.view2d, plotSize, projectRef.current.aspectLocked);
+    const cx = (view.xmin + view.xmax) / 2, cy = (view.ymin + view.ymax) / 2;
+    const width = (view.xmax - view.xmin) * factor / 2, height = (view.ymax - view.ymin) * factor / 2;
+    change2dView({ xmin: cx - width, xmax: cx + width, ymin: cy - height, ymax: cy + height });
+  }, [change2dView, plotSize]);
 
   const fitView = useCallback(target => {
     if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'fit' }));
-    else commit(previous => ({ ...previous, view2d: getFitView(previous.layers, previous.params, previous.view2d) }));
+    else change2dView(getFitView(projectRef.current.layers, projectRef.current.params, projectRef.current.view2d));
     notify('已适配当前绘制域；域外或超过安全范围的极值未包含');
-  }, [resolveView, commit, notify]);
+  }, [resolveView, change2dView, notify]);
 
   const resetView = useCallback(target => {
     if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'reset' }));
-    else commit(previous => ({ ...previous, view2d: { ...START_VIEW } }));
-  }, [resolveView, commit]);
+    else change2dView({ ...START_VIEW });
+  }, [resolveView, change2dView]);
 
   const zoomActive = useCallback((factor, target) => {
     if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: factor < 1 ? 'zoomIn' : 'zoomOut' }));
@@ -630,7 +683,7 @@ export default function App() {
     if (type === 'toggleProjection') setProjection(value => value === '透视' ? '正交' : '透视');
   }, []);
 
-  const handleCameraChange = useCallback((next, initial = false) => {
+  const handleCameraChange = useCallback((next, initial = false, options = {}) => {
     if (initial) {
       if (projectRef.current.camera3d) return;
       const baseline = { ...projectRef.current, camera3d: next };
@@ -639,7 +692,7 @@ export default function App() {
       return;
     }
     commit(previous => JSON.stringify(previous.camera3d) === JSON.stringify(next)
-      ? previous : { ...previous, camera3d: next });
+      ? previous : { ...previous, camera3d: next }, selectedRef.current, { ...options, fromCamera: true });
   }, [commit]);
 
   const copyCoordinates = useCallback(async point => {
@@ -653,6 +706,28 @@ export default function App() {
     } catch (error) { notify(`复制失败：${error.message}`); }
   }, [notify]);
 
+  const getProbe = source => {
+    const probe = project.probes?.[source];
+    if (!probe) return null;
+    const layer = probe.layerId ? project.layers.find(item => item.id === probe.layerId) : null;
+    const valid = (source !== '3d' || threeAvailable) && !staleInView(source) && (!probe.layerId || (layer?.visible && layer.opacity > 0 && !readPlot(layer).error && probe.signature === probeSignature(layer, project.params)));
+    return { ...probe, valid, name: layer?.name || '画布坐标' };
+  };
+  const probes = { '2d': getProbe('2d'), '3d': getProbe('3d') };
+  const pinProbe = (source, point, layerId) => {
+    const layer = projectRef.current.layers.find(item => item.id === layerId);
+    const probe = { point, layerId: layerId || null, signature: layer ? probeSignature(layer, projectRef.current.params) : '' };
+    commit(previous => ({ ...previous, probes: { ...previous.probes, [source]: probe } }));
+    notify(source === '3d' ? '已固定近似采样命中点；图形改变后需重新固定' : '已固定画布坐标；图形改变后需重新固定');
+  };
+  const clearProbe = source => commit(previous => ({ ...previous, probes: { ...previous.probes, [source]: null } }));
+  const renderProbe = source => probes[source] && <div className="probe-readout" data-probe={source} data-valid={probes[source].valid}>
+    <div><strong>{source.toUpperCase()} 固定探针 · {probes[source].name}</strong><span>{probes[source].valid ? Object.entries(probes[source].point).map(([axis, value]) => `${axis} ${source === '3d' ? '≈ ' : ''}${formatNumber(value)}`).join(' · ') : '坐标已失效，请重新固定'}</span></div>
+    <button onClick={() => copyCoordinates(probes[source].point)} disabled={!probes[source].valid}>复制</button><button onClick={() => clearProbe(source)} aria-label={`清除 ${source.toUpperCase()} 固定探针`}>×</button>
+  </div>;
+  const sliderStart = () => { endHistoryGroup(); sliderHeld.current = true; };
+  const sliderEnd = () => { sliderHeld.current = false; endHistoryGroup(); };
+
   const menuLayer = contextMenu?.layerId ? project.layers.find(layer => layer.id === contextMenu.layerId) : null;
   const menuItems = [];
   if (contextMenu) {
@@ -664,16 +739,17 @@ export default function App() {
     const separator = () => menuItems.push({ separator: true });
     if (menuLayer) {
       menuItems.push(
-        item('edit', '编辑表达式', () => editLayer(menuLayer.id)),
-        item('rename', '重命名', () => { setSidebarTab('layers'); setRenamingId(menuLayer.id); }),
+        item('edit', '编辑表达式', () => editLayer(menuLayer.id), menuLayer.locked, '请先解锁'),
+        item('rename', '重命名', () => { setSidebarTab('layers'); setRenamingId(menuLayer.id); }, menuLayer.locked, '请先解锁'),
         item('duplicate', '复制图层', () => duplicateLayer(menuLayer.id), project.layers.length >= 200, '已达 200 层'),
+        item('lock', menuLayer.locked ? '解锁图层' : '锁定图层', () => { updateLayer(menuLayer.id, { locked: !menuLayer.locked }); notify(menuLayer.locked ? '图层已解锁' : '图层已锁定；共享参数仍联动'); }),
         item('visibility', menuLayer.visible ? '隐藏图层' : '显示图层', () => updateLayer(menuLayer.id, { visible: !menuLayer.visible })),
       );
       separator();
       menuItems.push(
-        item('move-up', '上移一层', () => moveLayer(menuLayer.id, -1), index === 0, '已在最上方'),
-        item('move-down', '下移一层', () => moveLayer(menuLayer.id, 1), index === project.layers.length - 1, '已在最下方'),
-        item('delete', '删除图层', () => removeLayer(menuLayer.id), false, '', true),
+        item('move-up', '上移一层', () => moveLayer(menuLayer.id, -1), index === 0 || menuLayer.locked || project.layers[index - 1]?.locked, menuLayer.locked || project.layers[index - 1]?.locked ? '图层已锁定' : '已在最上方'),
+        item('move-down', '下移一层', () => moveLayer(menuLayer.id, 1), index === project.layers.length - 1 || menuLayer.locked || project.layers[index + 1]?.locked, menuLayer.locked || project.layers[index + 1]?.locked ? '图层已锁定' : '已在最下方'),
+        item('delete', '删除图层', () => removeLayer(menuLayer.id), menuLayer.locked, '请先解锁', true),
       );
     } else {
       menuItems.push(item('add', view === '3d' ? '添加三维表达式' : '添加二维表达式', () => addLayer(view), project.layers.length >= 200, '已达 200 层'));
@@ -693,6 +769,10 @@ export default function App() {
     if (view !== 'layers') {
       separator();
       if (view === '3d' && contextMenu.point) menuItems.push(item('focus', '聚焦此处', () => send3dCommand('focus', contextMenu.point), stale, '请先修正表达式'));
+      menuItems.push(item('view-settings', '精确视图设置', () => setShowViewSettings(true), unavailable, '3D 不可用'));
+      menuItems.push(item('view-back', '返回上一视图', () => travelView('back', view), !navigation.current[view].past.length || unavailable, unavailable ? '3D 不可用' : '没有上一视图'));
+      if (view === '2d') menuItems.push(item('box-zoom', '框选放大', () => { setBoxZoom(true); notify('拖出矩形放大；按 Esc 退出'); }));
+      if (contextMenu.point) menuItems.push(item('pin-probe', '固定此处坐标探针', () => pinProbe(view, contextMenu.point, contextMenu.layerId), stale || unavailable, '请先修正表达式'));
       if (contextMenu.point) menuItems.push(item('copy-coordinates', view === '3d' ? '复制近似命中点坐标' : '复制画布坐标', () => copyCoordinates(contextMenu.point), stale, '请先修正表达式'));
       menuItems.push(item('export', '导出当前画布 PNG', () => exportPng(view), stale || unavailable, unavailable ? '3D 不可用' : '请先修正表达式'));
     }
@@ -711,7 +791,8 @@ export default function App() {
   useEffect(() => {
     const handler = event => {
       if (event.defaultPrevented || contextRef.current) return;
-      const editing = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+      const active = document.activeElement;
+      const editing = active?.isContentEditable || active?.tagName === 'TEXTAREA' || (active?.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'color', 'file', 'button'].includes(active.type));
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); saveProject(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') { event.preventDefault(); openProject(); }
       else if (!editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z' && !event.shiftKey) { event.preventDefault(); undo(); }
@@ -720,22 +801,24 @@ export default function App() {
       else if (!editing && (event.key === '+' || event.key === '=')) zoomActive(0.8);
       else if (!editing && event.key === '-') zoomActive(1.25);
       else if (!editing && event.key === '?') setShowHelp(value => !value);
-      else if (event.key === 'Escape') setShowHelp(false);
+      else if (!editing && event.altKey && event.key === 'ArrowLeft') { event.preventDefault(); travelView('back'); }
+      else if (!editing && event.altKey && event.key === 'ArrowRight') { event.preventDefault(); travelView('forward'); }
+      else if (event.key === 'Escape') { setShowHelp(false); setBoxZoom(false); }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [saveProject, openProject, undo, redo, fitView, zoomActive]);
+  }, [saveProject, openProject, undo, redo, fitView, zoomActive, travelView]);
 
-  const statusText = status?.message || (status?.cursor ? Object.entries(status.cursor).map(([key, value]) => `${key} ${formatNumber(value)}`).join('  ·  ') : '准备就绪');
+  const statusText = status?.message || (status?.cursor ? Object.entries(status.cursor).map(([key, value]) => `${key} ${status.approximate ? '≈ ' : ''}${formatNumber(value)}`).join('  ·  ') : '准备就绪');
 
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><span className="brand-mark" aria-hidden="true">∿</span><div className="brand-copy"><strong>图形绘制实验室</strong><small>MATH ATLAS</small></div></div>
-      <div className="project-identity"><span className="topbar-divider" /><input value={project.name} aria-label="工程名称" onChange={event => commit(previous => ({ ...previous, name: event.target.value }))} /><span className={`save-indicator ${dirty ? 'is-dirty' : ''}`}>{filePath ? (dirty ? '未保存' : '已保存') : '本地草稿'}</span></div>
+      <div className="project-identity"><span className="topbar-divider" /><input value={project.name} aria-label="工程名称" onBlur={endHistoryGroup} onChange={event => commit(previous => ({ ...previous, name: event.target.value }), selectedRef.current, { group: 'project-name' })} /><span className={`save-indicator ${dirty ? 'is-dirty' : ''}`}>{filePath ? (dirty ? '未保存' : '已保存') : '本地草稿'}</span></div>
       <div className="topbar-spacer" />
       <div className="topbar-actions">
-        <IconButton icon="undo" label="撤销 Ctrl+Z" onClick={undo} disabled={!past.current.length} />
-        <IconButton icon="redo" label="重做 Ctrl+Shift+Z" onClick={redo} disabled={!future.current.length} />
+        <IconButton icon="undo" label="撤销 Ctrl+Z" onClick={undo} disabled={!history.current.past.length} />
+        <IconButton icon="redo" label="重做 Ctrl+Shift+Z" onClick={redo} disabled={!history.current.future.length} />
         <span className="action-separator" />
         <button className="text-button" aria-label="打开工程" onClick={openProject}><Icon name="folder" />打开</button>
         <button className="text-button" aria-label="保存工程" onClick={() => saveProject()}><Icon name="save" />保存</button>
@@ -751,7 +834,7 @@ export default function App() {
           <div className="section-line"><span>表达式与对象</span><IconButton icon="plus" label="新增图层" onClick={addLayer} /></div>
           <div className="layer-list">{project.layers.map((layer, index) => {
             const validity = readPlot(layer);
-            return <div key={layer.id} data-layer-id={layer.id} tabIndex={0} role="group" aria-label={`${layer.name}，${layer.visible ? '可见' : '隐藏'}`} aria-haspopup="menu"
+            return <div key={layer.id} data-layer-id={layer.id} tabIndex={0} role="group" aria-label={`${layer.name}，${layer.visible ? '可见' : '隐藏'}${layer.locked ? '，已锁定' : ''}`} aria-haspopup="menu"
               className={`layer-row ${selectedId === layer.id ? 'selected' : ''} ${validity.error ? 'invalid' : ''}`}
               onClick={() => selectLayer(layer.id)} onFocus={event => { if (event.target === event.currentTarget) selectLayer(layer.id); }}
               onContextMenu={event => rowContext(event, layer)} onKeyDown={event => {
@@ -762,31 +845,33 @@ export default function App() {
               <div className="layer-main">{renamingId === layer.id ? <LayerNameEditor name={layer.name} onFinish={name => {
                 setRenamingId(null); updateLayer(layer.id, { name });
                 window.requestAnimationFrame(() => [...document.querySelectorAll('[data-layer-id]')].find(row => row.dataset.layerId === layer.id)?.focus());
-              }} /> : <strong>{layer.name}</strong>}<small>{layer.expression}</small></div>
+              }} /> : <strong>{layer.name}{layer.locked && <span className="layer-lock" title="已锁定"><Icon name="lock" size={12} /></span>}</strong>}<small>{layer.expression}</small></div>
               <button className="layer-visibility" title={layer.visible ? '隐藏图层' : '显示图层'} aria-label={layer.visible ? '隐藏图层' : '显示图层'} onClick={event => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}><Icon name={layer.visible ? 'eye' : 'eyeOff'} size={16} /></button>
             </div>;
           })}</div>
           <button className="add-layer" onClick={addLayer}><Icon name="plus" size={17} />添加表达式</button>
           <div className="sidebar-note"><span className="note-icon">✦</span><div><strong>从图形开始理解</strong><p>试着改变一个参数，再观察曲线如何移动。</p></div></div>
         </div> : <div className="sidebar-body examples-body"><p className="sidebar-intro">打开一个示例，拖动参数，看看数学如何变成图形。</p>{EXAMPLES.map(example => <button key={example.id} className={`example-card ${project.exampleId === example.id ? 'current' : ''}`} onClick={() => loadExample(example)}><span className="example-symbol">{example.symbol}</span><span><strong>{example.title}</strong><small>{example.group}</small></span><Icon name="chevron" size={15} /></button>)}{recoveryItems.length > 0 && <div className="recovery-list"><div className="section-line">未保存工程的恢复副本</div>{recoveryItems.map(item => <button key={item.savedAt} className="recovery-card" onClick={() => restoreRecovery(item)}><strong>{item.project?.name || '未命名工程'}</strong><small>{new Date(item.savedAt).toLocaleString('zh-CN')}</small></button>)}</div>}</div>}
-        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.2</span></div>
+        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.3</span></div>
       </aside>
 
       <main className="main-area">
         <div className="canvas-toolbar"><div className="view-segment" role="tablist" aria-label="画布视图"><button className={project.mode === '2d' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: '2d' }))}><Icon name="chart" size={16} />2D</button><button className={project.mode === '3d' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: '3d' }))}><Icon name="cube" size={16} />3D</button><button className={project.mode === 'split' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: 'split' }))}>分屏</button></div>
           {activeCanvas === '2d' && <div className="coord-segment"><span>坐标系</span><select value={project.coordinateSystem || 'cartesian'} onChange={event => commit(previous => ({ ...previous, coordinateSystem: event.target.value }))} aria-label="坐标系"><option value="cartesian">直角坐标</option><option value="polar">极坐标</option></select></div>}
           {activeCanvas === '3d' && <div className="camera-controls"><button onClick={() => send3dCommand('toggleProjection')} title="切换透视／正交投影">{projection}</button><button onClick={() => send3dCommand('top')} title="从上方看">俯视</button><button onClick={() => send3dCommand('front')} title="从前方看">正视</button><button onClick={() => send3dCommand('side')} title="从侧面看">侧视</button></div>}
-          <div className="toolbar-spacer" /><div className="toolbar-actions"><IconButton icon="zoomOut" label="缩小" onClick={() => zoomActive(1.25)} /><IconButton icon="zoomIn" label="放大" onClick={() => zoomActive(0.8)} /><span className="action-separator" /><IconButton icon="fit" label="适配内容 F" onClick={fitView} /><IconButton icon="reset" label="重置视图" onClick={resetView} /><IconButton icon="sliders" label="显示设置面板" onClick={() => setShowRight(value => !value)} className="mobile-settings" /></div></div>
+          <div className="toolbar-spacer" /><div className="toolbar-actions"><IconButton icon="back" label="返回上一视图 Alt+←" onClick={() => travelView('back')} disabled={!navigation.current[activeCanvas].past.length} /><IconButton icon="forward" label="前进下一视图 Alt+→" onClick={() => travelView('forward')} disabled={!navigation.current[activeCanvas].future.length} /><button className={`text-button ${showViewSettings ? 'is-active' : ''}`} aria-expanded={showViewSettings} onClick={() => setShowViewSettings(value => !value)}>视图设置</button><IconButton icon="zoomOut" label="缩小" onClick={() => zoomActive(1.25)} /><IconButton icon="zoomIn" label="放大" onClick={() => zoomActive(0.8)} /><span className="action-separator" /><IconButton icon="fit" label="适配内容 F" onClick={fitView} /><IconButton icon="reset" label="重置视图" onClick={resetView} /><IconButton icon="sliders" label="显示设置面板" onClick={() => setShowRight(value => !value)} className="mobile-settings" /></div></div>
+        {showViewSettings && <ViewSettings key={activeCanvas} target={activeCanvas} view={displayedView} box={project.box3d || DEFAULT_BOX} aspectLocked={project.aspectLocked} onApply={next => { change2dView(next); notify('二维视图范围已应用'); }} onAspect={locked => commit(previous => ({ ...previous, aspectLocked: locked }))} onBox={box => { commit(previous => ({ ...previous, box3d: box })); notify('三维参考坐标盒已更新'); }} onClose={() => setShowViewSettings(false)} />}
         <div className={`canvas-stage mode-${project.mode}`}>
-          {(project.mode === '2d' || project.mode === 'split') && <section className={`plot-panel plot-panel-2d ${activeCanvas === '2d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('2d')} onFocusCapture={() => setActiveView('2d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面{project.mode === 'split' && activeCanvas === '2d' ? ' · 当前' : ''}</span>{staleInView('2d') && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div><Plot2D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={setStatus} view={project.view2d || START_VIEW} onViewChange={next => commit(previous => ({ ...previous, view2d: next }))} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={() => addLayer('2d')}>添加表达式</button></div>}</section>}
-          {(project.mode === '3d' || project.mode === 'split') && <section className={`plot-panel plot-panel-3d ${activeCanvas === '3d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('3d')} onFocusCapture={() => setActiveView('3d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot dot-3d" />三维空间{project.mode === 'split' && activeCanvas === '3d' ? ' · 当前' : ''}</span>{staleInView('3d') && <span className="stale-chip">上一有效结果</span>}</div><Plot3D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={setStatus} canvasRef={plot3dRef} theme={theme} viewCommand={viewCommand} cameraState={project.camera3d} onCameraChange={handleCameraChange} />{!has3dLayer && <div className="empty-plot empty-plot-3d"><span>◈</span><h3>让函数进入三维空间</h3><p>打开曲面示例，旋转视角观察高度变化。</p><button onClick={() => addLayer('3d')}>添加三维表达式</button></div>}</section>}
+          {(project.mode === '2d' || project.mode === 'split') && <section className={`plot-panel plot-panel-2d ${activeCanvas === '2d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('2d')} onFocusCapture={() => setActiveView('2d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面{project.mode === 'split' && activeCanvas === '2d' ? ' · 当前' : ''}</span>{staleInView('2d') && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div>{boxZoom && <div className="box-mode-hint">拖出矩形放大 · Esc 退出<button onClick={() => setBoxZoom(false)}>退出</button></div>}<Plot2D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={next => { if (activeCanvas === '2d') setStatus(next); }} view={project.view2d || START_VIEW} onViewChange={change2dView} onHistoryEnd={endHistoryGroup} onSize={setPlotSize} aspectLocked={project.aspectLocked} boxZoom={boxZoom} onBoxComplete={() => setBoxZoom(false)} probe={probes['2d']} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={() => addLayer('2d')}>添加表达式</button></div>}</section>}
+          {(project.mode === '3d' || project.mode === 'split') && <section className={`plot-panel plot-panel-3d ${activeCanvas === '3d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('3d')} onFocusCapture={() => setActiveView('3d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot dot-3d" />三维空间{project.mode === 'split' && activeCanvas === '3d' ? ' · 当前' : ''}</span>{staleInView('3d') && <span className="stale-chip">上一有效结果</span>}</div><Plot3D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={next => { if (activeCanvas === '3d') setStatus({ ...next, approximate: !!next.cursor }); }} onAvailabilityChange={setThreeAvailable} box={project.box3d || DEFAULT_BOX} probe={probes['3d']} canvasRef={plot3dRef} theme={theme} viewCommand={viewCommand} cameraState={project.camera3d} onCameraChange={handleCameraChange} />{!has3dLayer && <div className="empty-plot empty-plot-3d"><span>◈</span><h3>让函数进入三维空间</h3><p>打开曲面示例，旋转视角观察高度变化。</p><button onClick={() => addLayer('3d')}>添加三维表达式</button></div>}</section>}
         </div>
-        <div className="statusbar"><div className="status-left"><span className="status-live-dot" />{statusText}</div><div className="status-right"><span>{project.mode === '3d' ? '拖动旋转 · 滚轮缩放' : '拖动平移 · 滚轮缩放'}</span><span className="status-divider" /><span>{project.mode === '3d' ? '3D' : project.coordinateSystem === 'polar' ? '极坐标' : '直角坐标'}</span><button onClick={() => setShowHelp(true)} title="查看快捷键">?</button></div></div>
+        <div className="probe-tray">{renderProbe('2d')}{renderProbe('3d')}</div>
+        <div className="statusbar"><div className="status-left"><span className="status-live-dot" />{statusText}</div><div className="status-right"><span>{activeCanvas === '3d' ? '拖动旋转 · 滚轮缩放' : '拖动平移 · 滚轮缩放'}</span><span className="status-divider" /><span>{activeCanvas === '3d' ? '3D' : project.coordinateSystem === 'polar' ? '极坐标' : '直角坐标'}</span><button onClick={() => setShowHelp(true)} title="查看快捷键">?</button></div></div>
       </main>
 
       <aside className={`right-sidebar ${showRight ? 'show' : ''}`}><div className="inspector-header"><span className="eyebrow">INSPECTOR</span><h2>{selectedLayer ? selectedLayer.name : '属性设置'}</h2><p>修改表达式和参数，观察画布中的变化。</p></div>
-        {selectedLayer ? <div className="inspector-scroll"><div className="inspector-section"><div className="field-heading"><label htmlFor="expression-input">表达式</label><button type="button" className={`formula-help-toggle ${showFormulaHelp ? 'is-open' : ''}`} aria-expanded={showFormulaHelp} aria-controls="formula-guide" onClick={() => setShowFormulaHelp(value => !value)}><Icon name="help" size={14} />公式说明</button></div>
-          <textarea id="expression-input" className={`expression-input ${selectedValidation?.error ? 'has-error' : ''}`} value={selectedLayer.expression} onChange={event => updateLayer(selectedLayer.id, { expression: event.target.value })} spellCheck={false} rows={selectedLayer.expression.length > 32 ? 3 : 2} />
+        {selectedLayer ? <div className="inspector-scroll"><div className="layer-lock-controls"><button aria-label={selectedLayer.locked ? '解锁当前图层' : '锁定当前图层'} onClick={() => { updateLayer(selectedLayer.id, { locked: !selectedLayer.locked }); notify(selectedLayer.locked ? '图层已解锁' : '图层已锁定；共享参数仍联动'); }}><Icon name="lock" size={14} />{selectedLayer.locked ? '已锁定 · 点击解锁' : '锁定图层'}</button>{selectedLayer.locked && <p>属性、排序和删除已锁定；仍可选择、显隐和复制。共享参数继续联动。</p>}</div><div className="inspector-section"><div className="field-heading"><label htmlFor="expression-input">表达式</label><button type="button" className={`formula-help-toggle ${showFormulaHelp ? 'is-open' : ''}`} aria-expanded={showFormulaHelp} aria-controls="formula-guide" onClick={() => setShowFormulaHelp(value => !value)}><Icon name="help" size={14} />公式说明</button></div>
+          <textarea id="expression-input" className={`expression-input ${selectedValidation?.error ? 'has-error' : ''}`} value={selectedLayer.expression} disabled={selectedLayer.locked} onBlur={endHistoryGroup} onChange={event => updateLayer(selectedLayer.id, { expression: event.target.value }, { group: `expression:${selectedLayer.id}` })} spellCheck={false} rows={selectedLayer.expression.length > 32 ? 3 : 2} />
           <div className="expression-hint">支持 sin、cos、^、π、参数与括号</div>
           {selectedValidation?.error && <div className="field-error" role="alert">{selectedValidation.error}</div>}
           {showFormulaHelp && <div className="formula-guide" id="formula-guide" role="region" aria-label="公式输入说明">
@@ -799,19 +884,23 @@ export default function App() {
           <div className="inspector-section"><div className="field-heading"><span>参数调节</span><span className="field-kicker">VARIABLES</span></div>{selectedParams.length ? selectedParams.map(key => {
             const range = project.ranges?.[key] || [-5, 5, 0.1];
             const value = Number.isFinite(project.params[key]) ? project.params[key] : 1;
-            return <div className="parameter" key={key}><div className="parameter-top"><span className="parameter-name">{key}</span><output>{formatNumber(value)}</output></div><input type="range" min={range[0]} max={range[1]} step={range[2]} value={value} aria-label={`参数 ${key}`} onChange={event => changeParameter(key, Number(event.target.value))} /><div className="parameter-range"><span>{range[0]}</span><span>{range[1]}</span></div></div>;
+            return <div className="parameter" key={key}><div className="parameter-top"><span className="parameter-name">{key}</span><output>{formatNumber(value)}</output></div><input type="range" min={range[0]} max={range[1]} step={range[2]} value={value} aria-label={`参数 ${key}`} onPointerDown={sliderStart} onPointerUp={sliderEnd} onPointerCancel={sliderEnd} onLostPointerCapture={sliderEnd} onBlur={sliderEnd} onChange={event => changeParameter(key, Number(event.target.value))} /><div className="parameter-range"><span>{range[0]}</span><span>{range[1]}</span></div></div>;
           }) : <p className="no-params">在表达式中加入 a、b 等字母，就能创建可拖动的参数。</p>}</div>
           <div className="inspector-section"><div className="field-heading"><span>绘制范围</span><span className="field-kicker">DOMAIN</span></div>
             {selectedPlotKind === 'surface3d' ? <>
-              <DomainRangeEditor label="X 轴" id={`${selectedLayer.id}-x`} range={domainPair(selectedLayer.domain, 'x', [-5, 5])} limit={1000} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: withSurfaceAxis(selectedLayer.domain, 'x', pair) })} />
-              <DomainRangeEditor label="Y 轴" id={`${selectedLayer.id}-y`} range={domainPair(selectedLayer.domain, 'y', [-5, 5])} limit={1000} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: withSurfaceAxis(selectedLayer.domain, 'y', pair) })} />
+              <DomainRangeEditor disabled={selectedLayer.locked} label="X 轴" id={`${selectedLayer.id}-x`} range={domainPair(selectedLayer.domain, 'x', [-5, 5])} limit={1000} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: withSurfaceAxis(selectedLayer.domain, 'x', pair) })} />
+              <DomainRangeEditor disabled={selectedLayer.locked} label="Y 轴" id={`${selectedLayer.id}-y`} range={domainPair(selectedLayer.domain, 'y', [-5, 5])} limit={1000} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: withSurfaceAxis(selectedLayer.domain, 'y', pair) })} />
               <p className="domain-hint">X、Y 可分别设置；Z 的高度由公式决定。</p>
             </> : <>
-              <DomainRangeEditor label={selectedPlotKind === 'curve3d' || selectedPlotKind === 'parametric2d' ? '参数 t' : selectedPlotKind === 'polar2d' ? '角度 θ（弧度）' : selectedPlot?.formulas?.x ? 'Y 轴' : 'X 轴'} id={`${selectedLayer.id}-domain`} range={normalizeDomain(selectedLayer.domain, selectedPlotKind)} limit={selectedPlotKind === 'curve3d' ? 1000 : undefined} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: pair })} />
+              <DomainRangeEditor disabled={selectedLayer.locked} label={selectedPlotKind === 'curve3d' || selectedPlotKind === 'parametric2d' ? '参数 t' : selectedPlotKind === 'polar2d' ? '角度 θ（弧度）' : selectedPlot?.formulas?.x ? 'Y 轴' : 'X 轴'} id={`${selectedLayer.id}-domain`} range={normalizeDomain(selectedLayer.domain, selectedPlotKind)} limit={selectedPlotKind === 'curve3d' ? 1000 : undefined} onInvalid={notify} onCommit={pair => updateLayer(selectedLayer.id, { domain: pair })} />
               <p className="domain-hint">仅绘制此范围内的部分。</p>
             </>}
           </div>
-          <div className="inspector-section"><div className="field-heading"><span>图层样式</span><span className="field-kicker">STYLE</span></div><div className="color-options">{COLORS.map(color => <button key={color} className={`color-swatch ${selectedLayer.color === color ? 'selected' : ''}`} style={{ '--swatch': color }} onClick={() => updateLayer(selectedLayer.id, { color })} title={`选择颜色 ${color}`} aria-label={`选择颜色 ${color}`} />)}</div><button className="delete-layer" onClick={() => removeLayer(selectedLayer.id)}><Icon name="trash" size={15} />删除此图层</button></div>
+          <div className="inspector-section"><div className="field-heading"><span>图层样式</span><span className="field-kicker">STYLE</span></div><div className="color-options">{COLORS.map(color => <button key={color} disabled={selectedLayer.locked} className={`color-swatch ${selectedLayer.color === color ? 'selected' : ''}`} style={{ '--swatch': color }} onClick={() => updateLayer(selectedLayer.id, { color })} title={`选择颜色 ${color}`} aria-label={`选择颜色 ${color}`} />)}</div>
+            <div className="style-fields"><label>线宽<input aria-label="图层线宽" type="number" min="1" max="12" step="0.1" value={selectedLayer.lineWidth} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d'} onChange={event => { const n = Number(event.target.value); if (Number.isFinite(n) && n >= 1 && n <= 12) updateLayer(selectedLayer.id, { lineWidth: n }, { group: `width:${selectedLayer.id}` }); }} onBlur={endHistoryGroup} /></label><label>线型<select aria-label="图层线型" value={selectedLayer.lineStyle} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d'} onChange={event => updateLayer(selectedLayer.id, { lineStyle: event.target.value })}><option value="solid">实线</option><option value="dashed">虚线</option><option value="dotted">点线</option></select></label></div>
+            <label className="opacity-field">透明度 <output>{Math.round(selectedLayer.opacity * 100)}%</output><input type="range" aria-label="图层透明度" min="0" max="1" step="0.01" value={selectedLayer.opacity} disabled={selectedLayer.locked} onPointerDown={sliderStart} onPointerUp={sliderEnd} onPointerCancel={sliderEnd} onLostPointerCapture={sliderEnd} onBlur={sliderEnd} onChange={event => updateLayer(selectedLayer.id, { opacity: Number(event.target.value) }, { group: `opacity:${selectedLayer.id}`, hold: sliderHeld.current })} /></label>
+            <p className="domain-hint">{selectedPlotKind === 'surface3d' ? '曲面支持颜色与透明度；线宽和线型用于曲线。' : '线宽以屏幕像素计；0% 透明度的图层不会被画布命中。'}</p>
+            <button className="delete-layer" disabled={selectedLayer.locked} onClick={() => removeLayer(selectedLayer.id)}><Icon name="trash" size={15} />删除此图层</button></div>
           <div className="inspector-section learning-section"><div className="learning-icon">✦</div><div><span className="field-kicker">数学小提示</span><p>{currentExample?.concept || '改变参数后，留意图像的位置、大小和形状。需要重新开始时，可从学习示例中打开一个模板。'}</p></div></div>
         </div> : <div className="inspector-empty">选择一个图层以编辑表达式和参数。</div>}
         <div className="inspector-bottom"><IconButton icon={theme === 'light' ? 'moon' : 'sun'} label={theme === 'light' ? '切换深色主题' : '切换浅色主题'} onClick={() => setTheme(value => value === 'light' ? 'dark' : 'light')} /><span>外观设置</span></div>
@@ -825,6 +914,6 @@ export default function App() {
         staleInView(contextMenu.source) ? '上一有效结果 · 请先修正表达式' :
         `${contextMenu.keyboard ? '键盘入口 · 画布中心' : contextMenu.source === '3d' ? (contextMenu.point ? '采样命中点' : '视图操作') : '画布位置'}${contextMenu.point ? ' · ' + Object.entries(contextMenu.point).map(([axis, value]) => `${axis} ${contextMenu.source === '3d' ? '≈ ' : ''}${formatNumber(value)}`).join('，') : ''}`} />}
     {toast && <div className="toast" role="status">{toast}</div>}
-    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>右键单击画布或图层打开菜单。在三维画布中，左键拖动旋转、右键拖动平移、滚轮缩放。分屏时，工具栏操作作用于当前画布。</p><div className="shortcut-grid"><span>打开操作菜单</span><kbd>Shift + F10</kbd><span>选择 / 执行菜单项</span><kbd>↑ ↓ / Enter</kbd><span>关闭菜单</span><kbd>Esc</kbd><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
+    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>右键单击画布或图层打开菜单。在三维画布中，左键拖动旋转、右键拖动平移、滚轮缩放。分屏时，工具栏操作作用于当前画布。视图设置可输入范围、锁定等比例；Shift 拖动可框选放大。右键可固定坐标探针，图形改变后探针会失效。连续输入以停顿或离开输入框为一次撤销，输入框内 Ctrl+Z 保留文本撤销。</p><div className="shortcut-grid"><span>打开操作菜单</span><kbd>Shift + F10</kbd><span>选择 / 执行菜单项</span><kbd>↑ ↓ / Enter</kbd><span>关闭菜单</span><kbd>Esc</kbd><span>视图后退 / 前进</span><kbd>Alt + ← / →</kbd><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
   </div>;
 }
