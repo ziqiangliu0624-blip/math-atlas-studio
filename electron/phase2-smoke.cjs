@@ -225,10 +225,16 @@ app.whenReady().then(async () => {
   assert.equal((await snapshot()).project.layers[0].expression, 'y = a*cos(x)');
   await mouseClick('.plot2d canvas', 'left', .1,.1);
   await drag('[aria-label="参数 a"]', [.25,.5], [.75,.5]);
-  assert.notEqual((await snapshot()).project.params.a, 1);
-  await mouseClick('[aria-label="撤销 Ctrl+Z"]');
+  const draggedParameter = (await snapshot()).project.params.a;
+  assert.notEqual(draggedParameter, 1);
+  assert.equal(await js(() => document.activeElement.getAttribute('aria-label')), '参数 a');
+  await key('z', ['control']);
   assert.equal((await snapshot()).project.params.a, 1);
-  checks.push('连续公式输入和参数滑块合并，输入框 Ctrl+Z 保留文本撤销');
+  await key('z', ['control', 'shift']);
+  assert.equal((await snapshot()).project.params.a, draggedParameter);
+  await key('z', ['control']);
+  assert.equal((await snapshot()).project.params.a, 1);
+  checks.push('连续公式输入和滑块合并；文本框 Ctrl+Z 撤销文字，滑块焦点下 Ctrl+Z／Ctrl+Shift+Z 撤销／重做工程');
 
   await seed(fixture('2d'));
   await edit('[aria-label="图层线宽"]', 5);
@@ -287,6 +293,8 @@ app.whenReady().then(async () => {
   checks.push('视图前进后退独立于属性编辑，Alt+方向键作用于当前画布');
 
   await seed(fixture('3d'));
+  win.webContents.sendInputEvent({ type: 'mouseMove', ...await point('.plot3d canvas') });
+  await until(() => document.querySelector('.status-left')?.textContent.includes('≈'));
   await settings();
   await edit('[aria-label="3D X 最小值"]', -3); await edit('[aria-label="3D X 最大值"]', 8);
   await edit('[aria-label="3D Z 最大值"]', 4); await apply();
