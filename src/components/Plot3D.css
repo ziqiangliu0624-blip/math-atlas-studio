@@ -22,6 +22,7 @@
 }
 
 .plot3d__canvas canvas:active { cursor: grabbing; }
+.plot3d__canvas canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 
 .plot3d__hint {
   position: absolute;

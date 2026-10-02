@@ -1,6 +1,6 @@
 {
   "name": "math-atlas-studio",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Windows desktop app for learning 2D and 3D mathematical graphing",
@@ -10,6 +10,7 @@
     "desktop": "electron .",
     "build": "vite build",
     "smoke": "electron electron/smoke.cjs",
+    "smoke:interactions": "electron electron/interaction-smoke.cjs",
     "dist:win": "npm run build && electron-builder --win nsis",
     "test": "node --test src/math/*.test.mjs"
   },

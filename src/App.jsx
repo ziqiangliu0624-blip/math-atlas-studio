@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Plot2D from './components/Plot2D.jsx';
 import Plot3D from './components/Plot3D.jsx';
+import ContextMenu from './components/ContextMenu.jsx';
+import LayerNameEditor from './components/LayerNameEditor.jsx';
 import { compile, findParameters, parsePlot } from './math/engine.js';
 import { domainPair, normalizeDomain, withSurfaceAxis } from './math/domain.js';
 
@@ -284,12 +286,42 @@ export default function App() {
   const [viewCommand, setViewCommand] = useState({ id: 0, type: 'reset' });
   const [projection, setProjection] = useState('透视');
   const [recoveryItems, setRecoveryItems] = useState(loadRecoveries);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [renamingId, setRenamingId] = useState(null);
+  const [activeView, setActiveView] = useState('2d');
+  const projectRef = useRef(project);
+  const selectedRef = useRef(selectedId);
+  const contextRef = useRef(null);
   const plot2dRef = useRef(null);
   const plot3dRef = useRef(null);
   const importRef = useRef(null);
   const past = useRef([]);
   const future = useRef([]);
   const revisionRef = useRef(0);
+  const activeCanvas = project.mode === 'split' ? activeView : project.mode;
+  const resolveView = useCallback(target => target === '2d' || target === '3d' ? target : activeCanvas, [activeCanvas]);
+
+  const selectLayer = useCallback(id => {
+    selectedRef.current = id;
+    setSelectedId(id);
+  }, []);
+
+  const closeContextMenu = useCallback((restoreFocus = false) => {
+    const anchor = contextRef.current?.anchorElement;
+    contextRef.current = null;
+    setContextMenu(null);
+    if (restoreFocus && anchor?.isConnected) anchor.focus({ preventScroll: true });
+  }, []);
+
+  const openContextMenu = useCallback(context => {
+    if (context.layerId && !projectRef.current.layers.some(layer => layer.id === context.layerId)) return;
+    if (context.layerId) selectLayer(context.layerId);
+    if (context.source !== 'layers') setActiveView(context.source);
+    contextRef.current = context;
+    setContextMenu(context);
+  }, [selectLayer]);
+
+  useEffect(() => { closeContextMenu(); setRenamingId(null); }, [project.mode, closeContextMenu]);
 
   const selectedLayer = project.layers.find(layer => layer.id === selectedId) || project.layers[0];
   const selectedValidation = selectedLayer ? readPlot(selectedLayer) : null;
@@ -321,7 +353,8 @@ export default function App() {
     }
     return { has2dLayer, has3dLayer };
   }, [renderLayers]);
-  const hasStale = project.layers.some(layer => readPlot(layer).error);
+  const staleInView = useCallback(view => renderLayers.some(layer => layer.visible && layer.stale &&
+    (parsePlot(layer.expression).kind?.endsWith('3d') ? '3d' : '2d') === view), [renderLayers]);
 
   const notify = useCallback(message => {
     setToast(message);
@@ -329,39 +362,43 @@ export default function App() {
     notify.timer = window.setTimeout(() => setToast(''), 3600);
   }, []);
 
-  const commit = useCallback(updater => {
-    setProject(previous => {
-      const next = typeof updater === 'function' ? updater(previous) : updater;
-      if (next === previous) return previous;
-      past.current = [...past.current.slice(-39), previous];
-      future.current = [];
-      revisionRef.current += 1;
-      setDirty(true);
-      return next;
-    });
-  }, []);
+  const commit = useCallback((updater, nextSelection = selectedRef.current) => {
+    const previous = projectRef.current;
+    const next = typeof updater === 'function' ? updater(previous) : updater;
+    if (next === previous) return;
+    // History mutations stay outside React updaters, which StrictMode may replay.
+    past.current = [...past.current.slice(-39), { project: previous, selectedId: selectedRef.current }];
+    future.current = [];
+    revisionRef.current += 1;
+    projectRef.current = next;
+    setProject(next);
+    selectLayer(nextSelection);
+    setDirty(true);
+  }, [selectLayer]);
 
   const undo = useCallback(() => {
     if (!past.current.length) return;
-    setProject(previous => {
-      const next = past.current.pop();
-      future.current.push(previous);
-      revisionRef.current += 1;
-      setDirty(true);
-      return next;
-    });
-  }, []);
+    closeContextMenu(); setRenamingId(null);
+    future.current.push({ project: projectRef.current, selectedId: selectedRef.current });
+    const next = past.current.pop();
+    projectRef.current = next.project;
+    setProject(next.project);
+    selectLayer(next.selectedId);
+    revisionRef.current += 1;
+    setDirty(true);
+  }, [selectLayer, closeContextMenu]);
 
   const redo = useCallback(() => {
     if (!future.current.length) return;
-    setProject(previous => {
-      const next = future.current.pop();
-      past.current.push(previous);
-      revisionRef.current += 1;
-      setDirty(true);
-      return next;
-    });
-  }, []);
+    closeContextMenu(); setRenamingId(null);
+    past.current.push({ project: projectRef.current, selectedId: selectedRef.current });
+    const next = future.current.pop();
+    projectRef.current = next.project;
+    setProject(next.project);
+    selectLayer(next.selectedId);
+    revisionRef.current += 1;
+    setDirty(true);
+  }, [selectLayer, closeContextMenu]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -382,9 +419,9 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedId || !project.layers.some(layer => layer.id === selectedId)) {
-      setSelectedId(project.layers[0]?.id);
+      selectLayer(project.layers[0]?.id);
     }
-  }, [project.layers, selectedId]);
+  }, [project.layers, selectedId, selectLayer]);
 
   const stashRecovery = useCallback(snapshot => {
     try {
@@ -397,15 +434,17 @@ export default function App() {
 
   const switchProject = useCallback((next, path = null, isDirty = false) => {
     if (dirty && !stashRecovery(project)) return false;
+    closeContextMenu(); setRenamingId(null);
     past.current = [];
     future.current = [];
     revisionRef.current += 1;
+    projectRef.current = next;
     setProject(next);
-    setSelectedId(next.layers[0]?.id);
+    selectLayer(next.layers[0]?.id);
     setFilePath(path);
     setDirty(isDirty);
     return true;
-  }, [dirty, project, stashRecovery]);
+  }, [dirty, project, stashRecovery, closeContextMenu, selectLayer]);
 
   const loadExample = useCallback(example => {
     const next = projectFromExample(example);
@@ -416,6 +455,8 @@ export default function App() {
 
   const updateLayer = useCallback((id, changes) => {
     commit(previous => {
+      const original = previous.layers.find(layer => layer.id === id);
+      if (!original || Object.entries(changes).every(([key, value]) => original[key] === value)) return previous;
       const params = { ...previous.params };
       const ranges = { ...previous.ranges };
       const layers = previous.layers.map(layer => {
@@ -439,17 +480,47 @@ export default function App() {
     });
   }, [commit]);
 
-  const addLayer = useCallback(() => {
-    const is3d = project.mode === '3d';
+  const addLayer = useCallback(target => {
+    if (projectRef.current.layers.length >= 200) { notify('一个工程最多支持 200 个图层'); return; }
+    const is3d = resolveView(target) === '3d';
     const layer = makeLayer({ name: is3d ? '新曲面' : '新函数', expression: is3d ? 'z = sin(x)*cos(y)' : 'y = sin(x)', color: COLORS[project.layers.length % COLORS.length], domain: is3d ? { x: [-5, 5], y: [-5, 5] } : [-10, 10] }, project.layers.length);
-    commit(previous => ({ ...previous, exampleId: null, layers: [...previous.layers, layer] }));
-    setSelectedId(layer.id);
+    commit(previous => ({ ...previous, exampleId: null, layers: [...previous.layers, layer] }), layer.id);
     setSidebarTab('layers');
-  }, [commit, project.mode, project.layers.length]);
+  }, [commit, resolveView, project.layers.length, notify]);
 
   const removeLayer = useCallback(id => {
-    commit(previous => ({ ...previous, exampleId: null, layers: previous.layers.filter(layer => layer.id !== id) }));
+    const layers = projectRef.current.layers;
+    const index = layers.findIndex(layer => layer.id === id);
+    if (index < 0) return;
+    const nextSelection = selectedRef.current === id ? (layers[index + 1] || layers[index - 1])?.id : selectedRef.current;
+    commit(previous => ({ ...previous, exampleId: null, layers: previous.layers.filter(layer => layer.id !== id) }), nextSelection);
   }, [commit]);
+
+  const duplicateLayer = useCallback(id => {
+    const layers = projectRef.current.layers;
+    const index = layers.findIndex(layer => layer.id === id);
+    if (index < 0) return;
+    if (layers.length >= 200) { notify('一个工程最多支持 200 个图层'); return; }
+    const copy = { ...structuredClone(layers[index]), id: crypto.randomUUID(), name: `${layers[index].name.slice(0, 96)} 副本` };
+    commit(previous => ({ ...previous, exampleId: null, layers: [...previous.layers.slice(0, index + 1), copy, ...previous.layers.slice(index + 1)] }), copy.id);
+    notify('图层已复制；同名参数仍联动');
+  }, [commit, notify]);
+
+  const moveLayer = useCallback((id, direction) => {
+    commit(previous => {
+      const index = previous.layers.findIndex(layer => layer.id === id);
+      const destination = index + direction;
+      if (index < 0 || destination < 0 || destination >= previous.layers.length) return previous;
+      const layers = [...previous.layers];
+      [layers[index], layers[destination]] = [layers[destination], layers[index]];
+      return { ...previous, exampleId: null, layers };
+    });
+  }, [commit]);
+
+  const editLayer = useCallback(id => {
+    selectLayer(id); setShowRight(true);
+    window.requestAnimationFrame(() => { const input = document.getElementById('expression-input'); input?.focus(); input?.select(); });
+  }, [selectLayer]);
 
   const changeParameter = useCallback((key, value) => {
     commit(previous => ({ ...previous, params: { ...previous.params, [key]: value } }));
@@ -508,9 +579,10 @@ export default function App() {
     } catch (error) { notify(`恢复失败：${error.message}`); }
   }, [switchProject, notify]);
 
-  const exportPng = useCallback(async () => {
-    if (hasStale) { notify('请先修正表达式，再导出当前图像'); return; }
-    const canvas = project.mode === '3d' ? plot3dRef.current : plot2dRef.current;
+  const exportPng = useCallback(async target => {
+    const view = resolveView(target);
+    if (staleInView(view)) { notify('请先修正当前画布的表达式，再导出图像'); return; }
+    const canvas = view === '3d' ? plot3dRef.current : plot2dRef.current;
     if (!canvas) { notify('当前视图尚未准备好'); return; }
     try {
       const dataUrl = canvas.toDataURL('image/png');
@@ -523,9 +595,9 @@ export default function App() {
         link.download = `${project.name || '图形'}.png`;
         link.click();
       }
-      notify(project.mode === 'split' ? '已导出左侧 2D 画布' : 'PNG 已导出');
+      notify(`已导出 ${view.toUpperCase()} 画布 PNG`);
     } catch (error) { notify(`导出失败：${error.message}`); }
-  }, [hasStale, project.mode, project.name, notify]);
+  }, [staleInView, resolveView, project.name, notify]);
 
   const zoom2d = useCallback(factor => {
     commit(previous => {
@@ -537,39 +609,113 @@ export default function App() {
     });
   }, [commit]);
 
-  const fitView = useCallback(() => {
-    if (project.mode === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'fit' }));
+  const fitView = useCallback(target => {
+    if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'fit' }));
     else commit(previous => ({ ...previous, view2d: getFitView(previous.layers, previous.params, previous.view2d) }));
     notify('已适配当前绘制域；域外或超过安全范围的极值未包含');
-  }, [project.mode, commit, notify]);
+  }, [resolveView, commit, notify]);
 
-  const resetView = useCallback(() => {
-    if (project.mode === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'reset' }));
+  const resetView = useCallback(target => {
+    if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: 'reset' }));
     else commit(previous => ({ ...previous, view2d: { ...START_VIEW } }));
-  }, [project.mode, commit]);
+  }, [resolveView, commit]);
 
-  const zoomActive = useCallback(factor => {
-    if (project.mode === '3d') setViewCommand(command => ({ id: command.id + 1, type: factor < 1 ? 'zoomIn' : 'zoomOut' }));
+  const zoomActive = useCallback((factor, target) => {
+    if (resolveView(target) === '3d') setViewCommand(command => ({ id: command.id + 1, type: factor < 1 ? 'zoomIn' : 'zoomOut' }));
     else zoom2d(factor);
-  }, [project.mode, zoom2d]);
+  }, [resolveView, zoom2d]);
 
-  const send3dCommand = useCallback(type => {
-    setViewCommand(command => ({ id: command.id + 1, type }));
+  const send3dCommand = useCallback((type, point) => {
+    setViewCommand(command => ({ id: command.id + 1, type, point }));
     if (type === 'toggleProjection') setProjection(value => value === '透视' ? '正交' : '透视');
   }, []);
 
-  const handleCameraChange = useCallback(next => {
+  const handleCameraChange = useCallback((next, initial = false) => {
+    if (initial) {
+      if (projectRef.current.camera3d) return;
+      const baseline = { ...projectRef.current, camera3d: next };
+      projectRef.current = baseline;
+      setProject(baseline);
+      return;
+    }
     commit(previous => JSON.stringify(previous.camera3d) === JSON.stringify(next)
       ? previous : { ...previous, camera3d: next });
   }, [commit]);
 
+  const copyCoordinates = useCallback(async point => {
+    if (!point || !Object.values(point).every(Number.isFinite)) return;
+    const text = Object.entries(point).map(([axis, value]) => `${axis} = ${Number(value.toPrecision(8))}`).join(', ');
+    try {
+      if (window.desktop?.writeClipboardText) await window.desktop.writeClipboardText(text);
+      else if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else throw new Error('当前环境无法使用剪贴板');
+      notify(`已复制坐标：${text}`);
+    } catch (error) { notify(`复制失败：${error.message}`); }
+  }, [notify]);
+
+  const menuLayer = contextMenu?.layerId ? project.layers.find(layer => layer.id === contextMenu.layerId) : null;
+  const menuItems = [];
+  if (contextMenu) {
+    const view = contextMenu.source;
+    const unavailable = view === '3d' && contextMenu.available === false;
+    const stale = view !== 'layers' && staleInView(view);
+    const index = menuLayer ? project.layers.indexOf(menuLayer) : -1;
+    const item = (id, label, action, disabled = false, reason = '', danger = false) => ({ id, label, action, disabled, reason: disabled ? reason : '', danger });
+    const separator = () => menuItems.push({ separator: true });
+    if (menuLayer) {
+      menuItems.push(
+        item('edit', '编辑表达式', () => editLayer(menuLayer.id)),
+        item('rename', '重命名', () => { setSidebarTab('layers'); setRenamingId(menuLayer.id); }),
+        item('duplicate', '复制图层', () => duplicateLayer(menuLayer.id), project.layers.length >= 200, '已达 200 层'),
+        item('visibility', menuLayer.visible ? '隐藏图层' : '显示图层', () => updateLayer(menuLayer.id, { visible: !menuLayer.visible })),
+      );
+      separator();
+      menuItems.push(
+        item('move-up', '上移一层', () => moveLayer(menuLayer.id, -1), index === 0, '已在最上方'),
+        item('move-down', '下移一层', () => moveLayer(menuLayer.id, 1), index === project.layers.length - 1, '已在最下方'),
+        item('delete', '删除图层', () => removeLayer(menuLayer.id), false, '', true),
+      );
+    } else {
+      menuItems.push(item('add', view === '3d' ? '添加三维表达式' : '添加二维表达式', () => addLayer(view), project.layers.length >= 200, '已达 200 层'));
+      separator();
+      menuItems.push(
+        item('fit', '适配内容', () => fitView(view), unavailable, '3D 不可用'),
+        item('reset', '重置视图', () => resetView(view), unavailable, '3D 不可用'),
+      );
+      if (view === '3d') menuItems.push(
+        item('top', '俯视', () => send3dCommand('top'), unavailable, '3D 不可用'),
+        item('front', '正视', () => send3dCommand('front'), unavailable, '3D 不可用'),
+        item('side', '侧视', () => send3dCommand('side'), unavailable, '3D 不可用'),
+        item('projection', projection === '透视' ? '切换为正交投影' : '切换为透视投影', () => send3dCommand('toggleProjection'), unavailable, '3D 不可用'),
+      );
+      else menuItems.push(item('zoom-in', '放大', () => zoomActive(0.8, view)), item('zoom-out', '缩小', () => zoomActive(1.25, view)));
+    }
+    if (view !== 'layers') {
+      separator();
+      if (view === '3d' && contextMenu.point) menuItems.push(item('focus', '聚焦此处', () => send3dCommand('focus', contextMenu.point), stale, '请先修正表达式'));
+      if (contextMenu.point) menuItems.push(item('copy-coordinates', view === '3d' ? '复制近似命中点坐标' : '复制画布坐标', () => copyCoordinates(contextMenu.point), stale, '请先修正表达式'));
+      menuItems.push(item('export', '导出当前画布 PNG', () => exportPng(view), stale || unavailable, unavailable ? '3D 不可用' : '请先修正表达式'));
+    }
+  }
+
+  const rowContext = (event, layer) => {
+    if (event.target.closest('input')) return;
+    event.preventDefault(); event.stopPropagation();
+    const row = event.currentTarget;
+    const keyboard = event.type === 'keydown';
+    const rect = row.getBoundingClientRect();
+    openContextMenu({ source: 'layers', layerId: layer.id, anchorElement: row,
+      clientX: keyboard ? rect.left + 20 : event.clientX, clientY: keyboard ? rect.bottom : event.clientY });
+  };
+
   useEffect(() => {
     const handler = event => {
+      if (event.defaultPrevented || contextRef.current) return;
       const editing = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); saveProject(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') { event.preventDefault(); openProject(); }
-      else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z' && !event.shiftKey) { event.preventDefault(); undo(); }
-      else if ((event.ctrlKey || event.metaKey) && (event.key.toLowerCase() === 'y' || (event.shiftKey && event.key.toLowerCase() === 'z'))) { event.preventDefault(); redo(); }
+      else if (!editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z' && !event.shiftKey) { event.preventDefault(); undo(); }
+      else if (!editing && (event.ctrlKey || event.metaKey) && (event.key.toLowerCase() === 'y' || (event.shiftKey && event.key.toLowerCase() === 'z'))) { event.preventDefault(); redo(); }
       else if (!editing && event.key.toLowerCase() === 'f') fitView();
       else if (!editing && (event.key === '+' || event.key === '=')) zoomActive(0.8);
       else if (!editing && event.key === '-') zoomActive(1.25);
@@ -591,8 +737,8 @@ export default function App() {
         <IconButton icon="undo" label="撤销 Ctrl+Z" onClick={undo} disabled={!past.current.length} />
         <IconButton icon="redo" label="重做 Ctrl+Shift+Z" onClick={redo} disabled={!future.current.length} />
         <span className="action-separator" />
-        <button className="text-button" onClick={openProject}><Icon name="folder" />打开</button>
-        <button className="text-button" onClick={() => saveProject()}><Icon name="save" />保存</button>
+        <button className="text-button" aria-label="打开工程" onClick={openProject}><Icon name="folder" />打开</button>
+        <button className="text-button" aria-label="保存工程" onClick={() => saveProject()}><Icon name="save" />保存</button>
         <button className="primary-button" onClick={exportPng}><Icon name="download" />导出 PNG</button>
       </div>
     </header>
@@ -605,26 +751,35 @@ export default function App() {
           <div className="section-line"><span>表达式与对象</span><IconButton icon="plus" label="新增图层" onClick={addLayer} /></div>
           <div className="layer-list">{project.layers.map((layer, index) => {
             const validity = readPlot(layer);
-            return <div key={layer.id} className={`layer-row ${selectedId === layer.id ? 'selected' : ''} ${validity.error ? 'invalid' : ''}`} onClick={() => setSelectedId(layer.id)}>
+            return <div key={layer.id} data-layer-id={layer.id} tabIndex={0} role="group" aria-label={`${layer.name}，${layer.visible ? '可见' : '隐藏'}`} aria-haspopup="menu"
+              className={`layer-row ${selectedId === layer.id ? 'selected' : ''} ${validity.error ? 'invalid' : ''}`}
+              onClick={() => selectLayer(layer.id)} onFocus={event => { if (event.target === event.currentTarget) selectLayer(layer.id); }}
+              onContextMenu={event => rowContext(event, layer)} onKeyDown={event => {
+                if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) rowContext(event, layer);
+                else if (event.target === event.currentTarget && ['Enter', ' '].includes(event.key)) { event.preventDefault(); editLayer(layer.id); }
+              }}>
               <span className="layer-index">{String(index + 1).padStart(2, '0')}</span><span className="layer-color" style={{ background: layer.color }} />
-              <div className="layer-main"><strong>{layer.name}</strong><small>{layer.expression}</small></div>
+              <div className="layer-main">{renamingId === layer.id ? <LayerNameEditor name={layer.name} onFinish={name => {
+                setRenamingId(null); updateLayer(layer.id, { name });
+                window.requestAnimationFrame(() => [...document.querySelectorAll('[data-layer-id]')].find(row => row.dataset.layerId === layer.id)?.focus());
+              }} /> : <strong>{layer.name}</strong>}<small>{layer.expression}</small></div>
               <button className="layer-visibility" title={layer.visible ? '隐藏图层' : '显示图层'} aria-label={layer.visible ? '隐藏图层' : '显示图层'} onClick={event => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}><Icon name={layer.visible ? 'eye' : 'eyeOff'} size={16} /></button>
             </div>;
           })}</div>
           <button className="add-layer" onClick={addLayer}><Icon name="plus" size={17} />添加表达式</button>
           <div className="sidebar-note"><span className="note-icon">✦</span><div><strong>从图形开始理解</strong><p>试着改变一个参数，再观察曲线如何移动。</p></div></div>
         </div> : <div className="sidebar-body examples-body"><p className="sidebar-intro">打开一个示例，拖动参数，看看数学如何变成图形。</p>{EXAMPLES.map(example => <button key={example.id} className={`example-card ${project.exampleId === example.id ? 'current' : ''}`} onClick={() => loadExample(example)}><span className="example-symbol">{example.symbol}</span><span><strong>{example.title}</strong><small>{example.group}</small></span><Icon name="chevron" size={15} /></button>)}{recoveryItems.length > 0 && <div className="recovery-list"><div className="section-line">未保存工程的恢复副本</div>{recoveryItems.map(item => <button key={item.savedAt} className="recovery-card" onClick={() => restoreRecovery(item)}><strong>{item.project?.name || '未命名工程'}</strong><small>{new Date(item.savedAt).toLocaleString('zh-CN')}</small></button>)}</div>}</div>}
-        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.1</span></div>
+        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.2</span></div>
       </aside>
 
       <main className="main-area">
         <div className="canvas-toolbar"><div className="view-segment" role="tablist" aria-label="画布视图"><button className={project.mode === '2d' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: '2d' }))}><Icon name="chart" size={16} />2D</button><button className={project.mode === '3d' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: '3d' }))}><Icon name="cube" size={16} />3D</button><button className={project.mode === 'split' ? 'active' : ''} onClick={() => commit(previous => ({ ...previous, mode: 'split' }))}>分屏</button></div>
-          {project.mode !== '3d' && <div className="coord-segment"><span>坐标系</span><select value={project.coordinateSystem || 'cartesian'} onChange={event => commit(previous => ({ ...previous, coordinateSystem: event.target.value }))} aria-label="坐标系"><option value="cartesian">直角坐标</option><option value="polar">极坐标</option></select></div>}
-          {project.mode !== '2d' && <div className="camera-controls"><button onClick={() => send3dCommand('toggleProjection')} title="切换透视／正交投影">{projection}</button><button onClick={() => send3dCommand('top')} title="从上方看">俯视</button><button onClick={() => send3dCommand('front')} title="从前方看">正视</button><button onClick={() => send3dCommand('side')} title="从侧面看">侧视</button></div>}
+          {activeCanvas === '2d' && <div className="coord-segment"><span>坐标系</span><select value={project.coordinateSystem || 'cartesian'} onChange={event => commit(previous => ({ ...previous, coordinateSystem: event.target.value }))} aria-label="坐标系"><option value="cartesian">直角坐标</option><option value="polar">极坐标</option></select></div>}
+          {activeCanvas === '3d' && <div className="camera-controls"><button onClick={() => send3dCommand('toggleProjection')} title="切换透视／正交投影">{projection}</button><button onClick={() => send3dCommand('top')} title="从上方看">俯视</button><button onClick={() => send3dCommand('front')} title="从前方看">正视</button><button onClick={() => send3dCommand('side')} title="从侧面看">侧视</button></div>}
           <div className="toolbar-spacer" /><div className="toolbar-actions"><IconButton icon="zoomOut" label="缩小" onClick={() => zoomActive(1.25)} /><IconButton icon="zoomIn" label="放大" onClick={() => zoomActive(0.8)} /><span className="action-separator" /><IconButton icon="fit" label="适配内容 F" onClick={fitView} /><IconButton icon="reset" label="重置视图" onClick={resetView} /><IconButton icon="sliders" label="显示设置面板" onClick={() => setShowRight(value => !value)} className="mobile-settings" /></div></div>
         <div className={`canvas-stage mode-${project.mode}`}>
-          {(project.mode === '2d' || project.mode === 'split') && <section className="plot-panel plot-panel-2d"><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面</span>{hasStale && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div><Plot2D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={setSelectedId} onStatus={setStatus} view={project.view2d || START_VIEW} onViewChange={next => commit(previous => ({ ...previous, view2d: next }))} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={addLayer}>添加表达式</button></div>}</section>}
-          {(project.mode === '3d' || project.mode === 'split') && <section className="plot-panel plot-panel-3d"><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot dot-3d" />三维空间</span>{hasStale && <span className="stale-chip">上一有效结果</span>}</div><Plot3D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={setSelectedId} onStatus={setStatus} canvasRef={plot3dRef} theme={theme} viewCommand={viewCommand} cameraState={project.camera3d} onCameraChange={handleCameraChange} />{!has3dLayer && <div className="empty-plot empty-plot-3d"><span>◈</span><h3>让函数进入三维空间</h3><p>打开曲面示例，旋转视角观察高度变化。</p><button onClick={() => loadExample(EXAMPLES[3])}>打开三维示例</button></div>}</section>}
+          {(project.mode === '2d' || project.mode === 'split') && <section className={`plot-panel plot-panel-2d ${activeCanvas === '2d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('2d')} onFocusCapture={() => setActiveView('2d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面{project.mode === 'split' && activeCanvas === '2d' ? ' · 当前' : ''}</span>{staleInView('2d') && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div><Plot2D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={setStatus} view={project.view2d || START_VIEW} onViewChange={next => commit(previous => ({ ...previous, view2d: next }))} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={() => addLayer('2d')}>添加表达式</button></div>}</section>}
+          {(project.mode === '3d' || project.mode === 'split') && <section className={`plot-panel plot-panel-3d ${activeCanvas === '3d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('3d')} onFocusCapture={() => setActiveView('3d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot dot-3d" />三维空间{project.mode === 'split' && activeCanvas === '3d' ? ' · 当前' : ''}</span>{staleInView('3d') && <span className="stale-chip">上一有效结果</span>}</div><Plot3D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={setStatus} canvasRef={plot3dRef} theme={theme} viewCommand={viewCommand} cameraState={project.camera3d} onCameraChange={handleCameraChange} />{!has3dLayer && <div className="empty-plot empty-plot-3d"><span>◈</span><h3>让函数进入三维空间</h3><p>打开曲面示例，旋转视角观察高度变化。</p><button onClick={() => addLayer('3d')}>添加三维表达式</button></div>}</section>}
         </div>
         <div className="statusbar"><div className="status-left"><span className="status-live-dot" />{statusText}</div><div className="status-right"><span>{project.mode === '3d' ? '拖动旋转 · 滚轮缩放' : '拖动平移 · 滚轮缩放'}</span><span className="status-divider" /><span>{project.mode === '3d' ? '3D' : project.coordinateSystem === 'polar' ? '极坐标' : '直角坐标'}</span><button onClick={() => setShowHelp(true)} title="查看快捷键">?</button></div></div>
       </main>
@@ -664,7 +819,12 @@ export default function App() {
     </div>
 
     <input ref={importRef} type="file" accept=".graphproj,.json" hidden onChange={openBrowserFile} />
+    {contextMenu && <ContextMenu context={contextMenu} onClose={closeContextMenu} items={menuItems}
+      title={menuLayer?.name || (contextMenu.source === '3d' ? '三维画布' : '二维画布')}
+      caption={contextMenu.source === 'layers' ? '图层操作' : contextMenu.available === false ? '3D 绘制暂不可用' :
+        staleInView(contextMenu.source) ? '上一有效结果 · 请先修正表达式' :
+        `${contextMenu.keyboard ? '键盘入口 · 画布中心' : contextMenu.source === '3d' ? (contextMenu.point ? '采样命中点' : '视图操作') : '画布位置'}${contextMenu.point ? ' · ' + Object.entries(contextMenu.point).map(([axis, value]) => `${axis} ${contextMenu.source === '3d' ? '≈ ' : ''}${formatNumber(value)}`).join('，') : ''}`} />}
     {toast && <div className="toast" role="status">{toast}</div>}
-    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>拖动画布平移，滚轮放大缩小；在三维视图拖动可旋转曲面。</p><div className="shortcut-grid"><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
+    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>右键单击画布或图层打开菜单。在三维画布中，左键拖动旋转、右键拖动平移、滚轮缩放。分屏时，工具栏操作作用于当前画布。</p><div className="shortcut-grid"><span>打开操作菜单</span><kbd>Shift + F10</kbd><span>选择 / 执行菜单项</span><kbd>↑ ↓ / Enter</kbd><span>关闭菜单</span><kbd>Esc</kbd><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
   </div>;
 }

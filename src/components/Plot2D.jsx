@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { compile, parsePlot } from '../math/engine.js'
+import { bindContextGesture } from '../interaction/contextGesture.js'
 import './Plot2D.css'
 
 const DEFAULT_VIEW = { xmin: -10, xmax: 10, ymin: -6, ymax: 6 }
@@ -299,6 +300,8 @@ export default function Plot2D({
   params = {},
   selectedId = null,
   onSelectLayer,
+  onContextMenu,
+  onInteractionStart,
   onStatus,
   view,
   onViewChange,
@@ -310,6 +313,7 @@ export default function Plot2D({
   const localCanvasRef = useRef(null)
   const hitSegmentsRef = useRef([])
   const dragRef = useRef(null)
+  const contextCallbackRef = useRef(null)
   const [size, setSize] = useState({ width: 0, height: 0, dpr: 1 })
   const [internalView, setInternalView] = useState(DEFAULT_VIEW)
   const [cursor, setCursor] = useState(null)
@@ -376,7 +380,7 @@ export default function Plot2D({
       if (entry.layer.visible === false || entry.kind === 'error' || entry.kind === 'unsupported') continue
       const points = sampleLayer(entry, currentView, size.width, size.height, params)
       const segments = drawLayer(ctx, entry, points, entry.layer.id === selectedId, size.width, size.height)
-      hitSegments.push({ id: entry.layer.id, segments })
+      hitSegments.push({ id: entry.layer.id, segments, stale: entry.layer.stale })
     }
     hitSegmentsRef.current = hitSegments
   }, [size, currentView, parsedLayers, params, selectedId, dark, polarGrid])
@@ -387,14 +391,34 @@ export default function Plot2D({
     return { px: event.clientX - rect.left, py: event.clientY - rect.top }
   }, [])
 
+  const hitLayer = useCallback(position => {
+    if (!position) return null
+    let best = null
+    let closest = 9
+    // Later layers are painted on top; they win equal-distance overlaps.
+    for (const item of [...hitSegmentsRef.current].reverse()) {
+      for (const segment of item.segments) {
+        const distance = distanceToSegment(position.px, position.py, segment)
+        if (distance < closest) { best = item; closest = distance }
+      }
+    }
+    return best
+  }, [])
+
+  const worldPosition = position => ({
+    x: currentView.xmin + position.px * (currentView.xmax - currentView.xmin) / size.width,
+    y: currentView.ymax - position.py * (currentView.ymax - currentView.ymin) / size.height,
+  })
+
   const reportCursor = useCallback((position) => {
     if (!position || !size.width || !size.height) return
+    if (hitLayer(position)?.stale) { setCursor(null); onStatus?.({ cursor: null }); return }
     const x = currentView.xmin + position.px * (currentView.xmax - currentView.xmin) / size.width
     const y = currentView.ymax - position.py * (currentView.ymax - currentView.ymin) / size.height
     const next = { x, y }
     setCursor(next)
     onStatus?.({ cursor: { x, y } })
-  }, [currentView, size.width, size.height, onStatus])
+  }, [currentView, size.width, size.height, onStatus, hitLayer])
 
   const handleWheel = (event) => {
     event.preventDefault()
@@ -448,16 +472,8 @@ export default function Plot2D({
     if (!drag || drag.pointerId !== event.pointerId) return
     if (!drag.moved && typeof onSelectLayer === 'function') {
       const position = pointerPosition(event)
-      let best = { id: null, distance: 9 }
-      if (position) {
-        for (const item of hitSegmentsRef.current) {
-          for (const segment of item.segments) {
-            const distance = distanceToSegment(position.px, position.py, segment)
-            if (distance < best.distance) best = { id: item.id, distance }
-          }
-        }
-      }
-      if (best.id != null) onSelectLayer(best.id)
+      const best = hitLayer(position)
+      if (best) onSelectLayer(best.id)
     }
     dragRef.current = null
     event.currentTarget.releasePointerCapture?.(event.pointerId)
@@ -480,6 +496,18 @@ export default function Plot2D({
     const dy = key === 'ArrowDown' ? -spanY * 0.1 : key === 'ArrowUp' ? spanY * 0.1 : 0
     changeView({ xmin: currentView.xmin + dx, xmax: currentView.xmax + dx, ymin: currentView.ymin + dy, ymax: currentView.ymax + dy })
   }
+
+  contextCallbackRef.current = { onInteractionStart, open: location => {
+    const position = pointerPosition(location)
+    if (!position || !size.width || !size.height) return
+    const hit = hitLayer(position)
+    onContextMenu?.({ ...location, source: '2d', layerId: hit?.id,
+      point: worldPosition(position), anchorElement: localCanvasRef.current })
+  } }
+  useEffect(() => bindContextGesture(localCanvasRef.current, {
+    onOpen: location => contextCallbackRef.current.open(location),
+    onStart: () => contextCallbackRef.current.onInteractionStart?.(),
+  }), [])
 
   return (
     <div className={`plot2d ${dark ? 'plot2d--dark' : ''}`} ref={wrapperRef}>

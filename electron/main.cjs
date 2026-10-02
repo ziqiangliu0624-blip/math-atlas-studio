@@ -1,6 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, nativeTheme } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { registerTextTools } = require('./text-tools.cjs');
 
 let mainWindow;
 const allowedProjectPaths = new Set();
@@ -21,6 +22,7 @@ function createWindow() {
       sandbox: true
     }
   });
+  registerTextTools(mainWindow);
   mainWindow.once('ready-to-show', () => mainWindow.show());
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);

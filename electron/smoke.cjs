@@ -19,15 +19,16 @@ app.whenReady().then(async () => {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      backgroundThrottling: false
     }
   });
-  win.webContents.on('console-message', (_event, details) => {
+  win.webContents.on('console-message', details => {
     if (details.level === 'error') errors.push(details.message);
   });
   win.webContents.on('render-process-gone', (_event, details) => errors.push(`Renderer gone: ${details.reason}`));
   await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
-  await win.webContents.executeJavaScript("localStorage.removeItem('math-atlas-project-v1')");
+  await win.webContents.executeJavaScript("localStorage.removeItem('math-atlas-project-v1'); localStorage.removeItem('math-atlas-theme')");
   await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   await wait(1500);
   await fs.mkdir(outputDir, { recursive: true });
@@ -83,6 +84,9 @@ app.whenReady().then(async () => {
   assert.equal(cameraState?.projection, 'orthographic');
   await win.webContents.executeJavaScript("document.querySelector('.inspector-bottom button').click()");
   await wait(300);
+  assert.equal(await win.webContents.executeJavaScript("document.documentElement.dataset.theme"), 'dark');
+  await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  await win.webContents.capturePage();
   await fs.writeFile(path.join(outputDir, 'desktop-3d-dark.png'), (await win.webContents.capturePage()).toPNG());
   assert.deepEqual(errors, []);
   process.stdout.write(JSON.stringify({ summary, threeSummary, controls, surfaceDomain, reloadedDomain, cameraState, errors, outputDir }) + '\n');

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { compile, parsePlot } from '../math/engine.js';
+import { bindContextGesture } from '../interaction/contextGesture.js';
 import './Plot3D.css';
 
 const DOMAIN = 6;
@@ -125,7 +126,7 @@ function surfaceGeometry(formula, params, xDomain, yDomain) {
   return { geometry, clipped };
 }
 
-function curveObjects(formulas, params, color, layerId, tDomain) {
+function curveObjects(formulas, params, color, layerId, tDomain, stale) {
   const fx = compile(formulas.x);
   const fy = compile(formulas.y);
   const fz = compile(formulas.z);
@@ -138,6 +139,7 @@ function curveObjects(formulas, params, color, layerId, tDomain) {
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
     const line = new THREE.Line(geometry, material);
     line.userData.layerId = layerId;
+    line.userData.stale = stale;
     group.add(line);
     points = [];
   };
@@ -214,14 +216,16 @@ function disposeGuides(root) {
 
 /** Cartesian z-up canvas. The parent owns expressions, parameters and PNG export. */
 export default function Plot3D({ layers = [], params = {}, selectedId, onSelectLayer,
-  onStatus, canvasRef, theme = 'light', viewCommand, cameraState, onCameraChange }) {
+  onStatus, canvasRef, theme = 'light', viewCommand, cameraState, onCameraChange, onContextMenu, onInteractionStart }) {
   const hostRef = useRef(null);
   const runtimeRef = useRef(null);
-  const callbackRef = useRef({ onSelectLayer, onStatus, onCameraChange });
+  const callbackRef = useRef({ onSelectLayer, onStatus, onCameraChange, onContextMenu, onInteractionStart });
   const lastCommandRef = useRef(null);
   const lastInputCameraRef = useRef(null);
   const [error, setError] = useState('');
-  callbackRef.current = { onSelectLayer, onStatus, onCameraChange };
+  const errorRef = useRef(error);
+  errorRef.current = error;
+  callbackRef.current = { onSelectLayer, onStatus, onCameraChange, onContextMenu, onInteractionStart };
 
   useEffect(() => {
     const host = hostRef.current;
@@ -238,6 +242,9 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     }
 
     host.appendChild(renderer.domElement);
+    renderer.domElement.tabIndex = 0;
+    renderer.domElement.setAttribute('role', 'img');
+    renderer.domElement.setAttribute('aria-label', '三维画布。左键拖动旋转，右键拖动平移，右键单击打开菜单。');
     if (typeof canvasRef === 'function') canvasRef(renderer.domElement);
     else if (canvasRef) canvasRef.current = renderer.domElement;
     const scene = new THREE.Scene();
@@ -288,6 +295,11 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       reportTimer = window.setTimeout(() => {
         reportTimer = 0;
         reportPending = false;
+        // Finish residual damping before recording one stable gesture result.
+        const damping = controls.enableDamping;
+        controls.enableDamping = false;
+        controls.update();
+        controls.enableDamping = damping;
         emitCamera();
       }, 180);
     };
@@ -346,21 +358,24 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1,
         -((event.clientY - rect.top) / rect.height) * 2 + 1);
+      camera.updateMatrixWorld();
+      scene.updateMatrixWorld(true);
       raycaster.setFromCamera(pointer, camera);
-      return raycaster.intersectObjects(content.children, true)[0];
+      return raycaster.intersectObjects([...content.children].reverse(), true)[0];
     };
     let down = null;
     let hoverFrame = 0;
     let lastHover = 0;
-    const pointerDown = (event) => { down = { x: event.clientX, y: event.clientY }; };
+    const pointerDown = (event) => { down = event.button === 0 ? { x: event.clientX, y: event.clientY, moved: false } : null; };
     const pointerUp = (event) => {
-      if (!down || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) { down = null; return; }
+      if (!down || down.moved || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) { down = null; return; }
       down = null;
       const intersection = hit(event);
       const layerId = intersection?.object?.userData?.layerId;
       if (layerId != null) callbackRef.current.onSelectLayer?.(layerId);
     };
     const pointerMove = (event) => {
+      if (down && Math.hypot(event.clientX - down.x, event.clientY - down.y) > 5) down.moved = true;
       const now = performance.now();
       if (hoverFrame || now - lastHover < 75) return;
       const location = { clientX: event.clientX, clientY: event.clientY };
@@ -368,7 +383,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         hoverFrame = 0;
         lastHover = performance.now();
         const intersection = hit(location);
-        callbackRef.current.onStatus?.({ cursor: intersection ? {
+        callbackRef.current.onStatus?.({ cursor: intersection && !intersection.object.userData.stale ? {
           x: intersection.point.x, y: intersection.point.y, z: intersection.point.z,
         } : null });
       });
@@ -376,7 +391,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     const pointerLeave = () => callbackRef.current.onStatus?.({ cursor: null });
     const doubleClick = (event) => {
       const intersection = hit(event);
-      if (intersection) {
+      if (intersection && !intersection.object.userData.stale) {
         const delta = intersection.point.clone().sub(controls.target);
         controls.target.copy(intersection.point);
         camera.position.add(delta);
@@ -385,12 +400,26 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         scheduleCameraReport();
       }
     };
+    const unbindContext = bindContextGesture(renderer.domElement, {
+      capturePointer: false,
+      onStart: () => callbackRef.current.onInteractionStart?.(),
+      onOpen: location => {
+        runtimeRef.current?.flushCameraReport();
+        const intersection = errorRef.current ? null : hit(location);
+        const point = intersection ? { x: intersection.point.x, y: intersection.point.y, z: intersection.point.z } : null;
+        callbackRef.current.onContextMenu?.({ ...location, source: '3d',
+          layerId: intersection?.object.userData.layerId, point,
+          available: !errorRef.current, stale: intersection?.object.userData.stale, anchorElement: renderer.domElement });
+      },
+    });
     const contextLost = (event) => {
       event.preventDefault();
+      callbackRef.current.onInteractionStart?.();
       setError('3D 显卡连接已中断。请检查显卡驱动，或重新打开应用。');
       callbackRef.current.onStatus?.({ message: '3D 显卡连接已中断' });
     };
     const contextRestored = () => {
+      callbackRef.current.onInteractionStart?.();
       setError('');
       callbackRef.current.onStatus?.({ message: '3D 显卡连接已恢复' });
       invalidate();
@@ -416,6 +445,10 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       },
       applyCameraState(saved) {
         cancelCameraReport();
+        const damping = controls.enableDamping;
+        controls.enableDamping = false;
+        controls.update();
+        controls.enableDamping = damping;
         const next = saved.projection === 'orthographic' ? orthographic : perspective;
         camera = next;
         projection = saved.projection;
@@ -432,12 +465,22 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
         invalidate();
       },
       snapshotCamera() { return cameraSnapshot(camera, controls.target); },
+      flushCameraReport() {
+        const damping = controls.enableDamping;
+        controls.enableDamping = false;
+        controls.update();
+        controls.enableDamping = damping;
+        cancelCameraReport();
+        emitCamera();
+      },
+      reportCamera() { cancelCameraReport(); emitCamera(); },
       scheduleCameraReport,
       invalidate,
     };
     runtimeRef.current = runtime;
     const initialCamera = validCameraState(cameraState);
     if (initialCamera) runtime.applyCameraState(initialCamera);
+    else callbackRef.current.onCameraChange?.(runtime.snapshotCamera(), true);
     lastInputCameraRef.current = initialCamera;
     // A queued command from a previously hidden 3D view must not override the saved view.
     lastCommandRef.current = viewCommand?.id ?? null;
@@ -447,6 +490,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
       if (frame) window.cancelAnimationFrame(frame);
       if (hoverFrame) window.cancelAnimationFrame(hoverFrame);
       cancelCameraReport();
+      unbindContext();
       observer.disconnect();
       window.removeEventListener('resize', resize);
       controls.removeEventListener('change', controlsChanged);
@@ -512,10 +556,11 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
           });
           const mesh = new THREE.Mesh(geometry, material);
           mesh.userData.layerId = layer.id;
+          mesh.userData.stale = layer.stale;
           runtime.content.add(mesh);
         } else if (plot.kind === 'curve3d') {
           const { group, clipped } = curveObjects(plot.formulas, params, color, layer.id,
-            domainFor(layer, 't'));
+            domainFor(layer, 't'), layer.stale);
           if (clipped) notices.push(`${layer.name || '空间曲线'}：${clipped} 个无效或超出范围的采样点已跳过`);
           if (!group.children.length) notices.push(`${layer.name || '空间曲线'}：当前绘制域内没有有效图形`);
           runtime.content.add(group);
@@ -532,12 +577,18 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     const runtime = runtimeRef.current;
     if (!runtime || !viewCommand || lastCommandRef.current === viewCommand.id) return;
     lastCommandRef.current = viewCommand.id;
+    runtime.flushCameraReport();
     const { controls, perspective, orthographic } = runtime;
     const camera = runtime.camera;
     const direction = camera.position.clone().sub(controls.target);
     const distance = Math.max(1, direction.length());
     const radius = new THREE.Box3().setFromObject(runtime.content).getBoundingSphere(new THREE.Sphere()).radius;
-    if (viewCommand.type === 'reset') {
+    if (viewCommand.type === 'focus' && viewCommand.point) {
+      const point = new THREE.Vector3(viewCommand.point.x, viewCommand.point.y, viewCommand.point.z);
+      const delta = point.clone().sub(controls.target);
+      controls.target.copy(point);
+      camera.position.add(delta);
+    } else if (viewCommand.type === 'reset') {
       controls.target.set(0, 0, 0);
       camera.up.set(0, 0, 1);
       camera.position.set(13, -16, 11);
@@ -581,18 +632,28 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     camera.updateProjectionMatrix();
     controls.update();
     runtime.invalidate();
-    runtime.scheduleCameraReport();
+    runtime.reportCamera();
   }, [viewCommand]);
 
   return (
-    <div className="plot3d" aria-label="三维绘图画布">
+    <div className="plot3d" aria-label="三维绘图画布" tabIndex={error ? 0 : undefined}
+      onContextMenu={event => {
+        if (!error) return;
+        event.preventDefault();
+        onContextMenu?.({ source: '3d', available: false, clientX: event.clientX, clientY: event.clientY, anchorElement: event.currentTarget });
+      }} onKeyDown={event => {
+        if (!error || (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10'))) return;
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        onContextMenu?.({ source: '3d', available: false, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, anchorElement: event.currentTarget });
+      }}>
       <div className="plot3d__canvas" ref={hostRef} />
       {error && <div className="plot3d__fallback" role="alert">
         <div className="plot3d__fallback-icon" aria-hidden="true">◇</div>
         <strong>三维画布暂不可用</strong>
         <p>{error}</p>
       </div>}
-      {!error && <div className="plot3d__hint">拖动旋转 · 右键平移 · 滚轮缩放 · 双击聚焦</div>}
+      {!error && <div className="plot3d__hint">左键旋转 · 右键拖动平移 · 右键单击菜单</div>}
     </div>
   );
 }
