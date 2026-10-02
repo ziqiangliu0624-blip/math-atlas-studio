@@ -37,7 +37,7 @@ export function normalizeBox(box) {
 }
 
 export function probeSignature(layer, params) {
-  return JSON.stringify([layer.expression, layer.domain, params]);
+  return layer.type === 'geometry' ? JSON.stringify(layer.geometry) : JSON.stringify([layer.expression, layer.domain, params]);
 }
 
 export function normalizeProbes(probes, layers) {

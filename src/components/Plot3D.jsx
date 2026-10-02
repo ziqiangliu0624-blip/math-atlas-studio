@@ -1,3 +1,4 @@
+import { exportDimensions, isGeometry } from '../math/geometry.js';
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { Line2 } from 'three/addons/lines/Line2.js';
@@ -236,7 +237,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     if (!host) return undefined;
     let renderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     } catch {
@@ -498,6 +499,35 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     };
     runtimeRef.current = runtime;
     renderer.domElement.flushView = () => runtime.flushCameraReport();
+    renderer.domElement.exportPng = options => {
+      if (errorRef.current) throw new Error('3D 绘制暂不可用');
+      const dims = exportDimensions(options, { width: host.clientWidth, height: host.clientHeight });
+      runtime.flushCameraReport();
+      const savedSize = renderer.getSize(new THREE.Vector2()), ratio = renderer.getPixelRatio(), background = scene.background;
+      const savedProjection = { aspect: camera.aspect, fov: camera.fov, left: camera.left, right: camera.right, top: camera.top, bottom: camera.bottom };
+      const oldAspect = savedSize.x / savedSize.y, newAspect = dims.width / dims.height;
+      try {
+        if (camera.isPerspectiveCamera) {
+          camera.aspect = newAspect;
+          if (newAspect < oldAspect) camera.fov = 2 * Math.atan(Math.tan(savedProjection.fov * Math.PI / 360) * oldAspect / newAspect) * 180 / Math.PI;
+        } else {
+          const centerX = (camera.left + camera.right) / 2, centerY = (camera.top + camera.bottom) / 2;
+          const halfHeight = Math.max((camera.top - camera.bottom) / 2, (camera.right - camera.left) / 2 / newAspect);
+          camera.left = centerX - halfHeight * newAspect; camera.right = centerX + halfHeight * newAspect;
+          camera.bottom = centerY - halfHeight; camera.top = centerY + halfHeight;
+        }
+        camera.updateProjectionMatrix();
+        renderer.setPixelRatio(dims.scale); renderer.setSize(dims.width, dims.height, false);
+        if (dims.transparent) { scene.background = null; renderer.setClearAlpha(0); }
+        renderer.render(scene, camera);
+        return renderer.domElement.toDataURL('image/png');
+      } finally {
+        scene.background = background;
+        for (const [key, value] of Object.entries(savedProjection)) if (value !== undefined) camera[key] = value;
+        camera.updateProjectionMatrix(); renderer.setPixelRatio(ratio); renderer.setSize(savedSize.x, savedSize.y, false);
+        renderer.render(scene, camera);
+      }
+    };
     const initialCamera = validCameraState(cameraState);
     if (initialCamera) runtime.applyCameraState(initialCamera);
     else callbackRef.current.onCameraChange?.(runtime.snapshotCamera(), true);
@@ -561,7 +591,7 @@ export default function Plot3D({ layers = [], params = {}, selectedId, onSelectL
     disposeTree(runtime.content);
     const notices = [];
     for (const layer of layers) {
-      if (layer.visible === false || layer.opacity === 0) continue;
+      if (layer.visible === false || layer.opacity === 0 || isGeometry(layer)) continue;
       let plot;
       try { plot = parsePlot(layer.expression || ''); }
       catch { continue; }

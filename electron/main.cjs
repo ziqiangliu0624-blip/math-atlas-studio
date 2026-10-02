@@ -61,7 +61,7 @@ ipcMain.handle('project:open', async () => {
 });
 
 ipcMain.handle('project:save', async (_event, { project, path: existingPath }) => {
-  if (!project || project.schemaVersion !== 1 || !Array.isArray(project.layers)) throw new Error('工程数据无效');
+  if (!project || ![1, 2].includes(project.schemaVersion) || !Array.isArray(project.layers)) throw new Error('工程数据无效');
   let filePath = typeof existingPath === 'string' && allowedProjectPaths.has(existingPath) ? existingPath : null;
   if (!filePath) {
     const result = await dialog.showSaveDialog(mainWindow, {

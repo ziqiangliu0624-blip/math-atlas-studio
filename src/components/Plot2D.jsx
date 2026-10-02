@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { compile, parsePlot } from '../math/engine.js'
 import { validView, equalAspect } from '../math/view.js'
 import { bindContextGesture } from '../interaction/contextGesture.js'
+import { isGeometry, normalizeGeometry, transformGeometry, geometryCenter, exportDimensions, containExportView } from '../math/geometry.js'
+import { drawGeometry, textHitDistance } from './geometryCanvas.js'
 import './Plot2D.css'
 
 const DEFAULT_VIEW = { xmin: -10, xmax: 10, ymin: -6, ymax: 6 }
@@ -45,6 +47,7 @@ function getRange(layer, parsed, variable, fallback) {
 function prepareLayers(layers) {
   return (Array.isArray(layers) ? layers : []).map((layer) => {
     try {
+      if (isGeometry(layer)) return { layer, kind: 'geometry2d' }
       const parsed = parsePlot(layer.expression ?? '')
       if (parsed.error) return { layer, kind: 'error', error: parsed.error, evaluators: [] }
       const { kind, formulas = {} } = parsed
@@ -297,6 +300,7 @@ export default function Plot2D({
   onViewChange,
   onHistoryEnd, onSize, aspectLocked = false, boxZoom = false, onBoxComplete, probe,
   canvasRef,
+  geometryTool = 'select', onToolCancel, onGeometryCreate, onGeometryChange, onInvalid,
   theme = 'light',
   coordinateSystem = 'cartesian',
 }) {
@@ -309,8 +313,11 @@ export default function Plot2D({
   const [internalView, setInternalView] = useState(DEFAULT_VIEW)
   const [cursor, setCursor] = useState(null)
   const [selectionBox, setSelectionBox] = useState(null)
+  const [geometryPreview, setGeometryPreview] = useState(null)
+  const [creationStart, setCreationStart] = useState(null)
   const currentView = useMemo(() => equalAspect(safeView(view ?? internalView), size, aspectLocked), [view, internalView, size, aspectLocked])
-  const parsedLayers = useMemo(() => prepareLayers(layers), [layers])
+  const creationCursor = creationStart ? cursor : null
+  const parsedLayers = useMemo(() => prepareLayers(layers.map(layer => geometryPreview?.id === layer.id ? { ...layer, geometry: geometryPreview.geometry } : layer)), [layers, geometryPreview])
   const dark = theme === 'dark' || theme?.mode === 'dark'
   const polarGrid = coordinateSystem === 'polar'
   const palette = dark
@@ -352,32 +359,46 @@ export default function Plot2D({
 
   useEffect(() => { onSize?.({ width: size.width, height: size.height }); }, [size.width, size.height, onSize])
 
+  const renderCanvas = (ctx, width, height, renderView, interactive, transparent = false) => {
+    ctx.clearRect(0, 0, width, height)
+    if (!transparent) { ctx.fillStyle = palette.background; ctx.fillRect(0, 0, width, height) }
+    drawGrid(ctx, width, height, renderView, palette, polarGrid)
+    const hits = []
+    for (const entry of parsedLayers) {
+      if (entry.layer.visible === false || entry.layer.opacity === 0 || entry.kind === 'error' || entry.kind === 'unsupported') continue
+      const selected = interactive && entry.layer.id === selectedId
+      if (entry.kind === 'geometry2d') hits.push(drawGeometry(ctx, entry.layer, renderView, width, height, selected))
+      else {
+        const points = sampleLayer(entry, renderView, width, height, params)
+        const segments = drawLayer(ctx, entry, points, selected, width, height)
+        hits.push({ id: entry.layer.id, segments, stale: entry.layer.stale })
+      }
+    }
+    if (interactive && creationStart && cursor && ['segment', 'line', 'vector'].includes(geometryTool)) {
+      drawGeometry(ctx, { id: 'preview', color: '#5368d9', opacity: .5, lineStyle: 'dashed', geometry: { kind: geometryTool, points: [creationStart, [cursor.x, cursor.y]] } }, renderView, width, height)
+    }
+    return hits
+  }
+
   useEffect(() => {
     const canvas = localCanvasRef.current
     if (!canvas || !size.width || !size.height) return
-    const pixelWidth = Math.round(size.width * size.dpr)
-    const pixelHeight = Math.round(size.height * size.dpr)
-    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-      canvas.width = pixelWidth
-      canvas.height = pixelHeight
-    }
-    canvas.style.width = `${size.width}px`
-    canvas.style.height = `${size.height}px`
+    canvas.width = Math.round(size.width * size.dpr); canvas.height = Math.round(size.height * size.dpr)
+    canvas.style.width = `${size.width}px`; canvas.style.height = `${size.height}px`
     const ctx = canvas.getContext('2d')
-    if (!ctx) return
     ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0)
-    ctx.fillStyle = palette.background
-    ctx.fillRect(0, 0, size.width, size.height)
-    drawGrid(ctx, size.width, size.height, currentView, palette, polarGrid)
-    const hitSegments = []
-    for (const entry of parsedLayers) {
-      if (entry.layer.visible === false || entry.layer.opacity === 0 || entry.kind === 'error' || entry.kind === 'unsupported') continue
-      const points = sampleLayer(entry, currentView, size.width, size.height, params)
-      const segments = drawLayer(ctx, entry, points, entry.layer.id === selectedId, size.width, size.height)
-      hitSegments.push({ id: entry.layer.id, segments, stale: entry.layer.stale })
+    hitSegmentsRef.current = renderCanvas(ctx, size.width, size.height, currentView, true)
+    canvas.exportPng = options => {
+      const dimensions = exportDimensions(options, size)
+      const output = document.createElement('canvas'); output.width = dimensions.pixelWidth; output.height = dimensions.pixelHeight
+      const context = output.getContext('2d'); context.scale(dimensions.scale, dimensions.scale)
+      const exportView = containExportView(currentView, size, dimensions)
+      renderCanvas(context, dimensions.width, dimensions.height, exportView, false, dimensions.transparent)
+      return output.toDataURL('image/png')
     }
-    hitSegmentsRef.current = hitSegments
-  }, [size, currentView, parsedLayers, params, selectedId, dark, polarGrid])
+  }, [size, currentView, parsedLayers, params, selectedId, dark, polarGrid, creationStart, creationCursor, geometryTool])
+
+  useEffect(() => { setCreationStart(null); setGeometryPreview(null); dragRef.current = null }, [geometryTool])
 
   const pointerPosition = useCallback((event) => {
     const rect = localCanvasRef.current?.getBoundingClientRect()
@@ -391,8 +412,10 @@ export default function Plot2D({
     let closest = 9
     // Later layers are painted on top; they win equal-distance overlaps.
     for (const item of [...hitSegmentsRef.current].reverse()) {
+      const textDistance = textHitDistance(position, item.textBox)
+      if (textDistance < closest) { best = item; closest = textDistance }
       for (const segment of item.segments) {
-        const distance = distanceToSegment(position.px, position.py, segment)
+        const distance = Math.max(0, distanceToSegment(position.px, position.py, segment) - (item.hitRadius || 0))
         if (distance < closest) { best = item; closest = distance }
       }
     }
@@ -438,7 +461,31 @@ export default function Plot2D({
     if (event.button !== 0 && event.button !== 1) return
     const position = pointerPosition(event)
     if (!position) return
-    onHistoryEnd?.()
+    onHistoryEnd?.(); onInteractionStart?.(); event.currentTarget.focus()
+    if (event.button === 0 && !event.shiftKey && !boxZoom) {
+      const p = worldPosition(position)
+      if (['point', 'segment', 'line', 'vector', 'text'].includes(geometryTool)) {
+        if (geometryTool === 'point' || geometryTool === 'text') onGeometryCreate?.({ kind: geometryTool, points: [[p.x, p.y]], ...(geometryTool === 'text' ? { text: '文字标注', fontSize: 16, rotation: 0 } : {}) })
+        else if (!creationStart) setCreationStart([p.x, p.y])
+        else { try { const g = normalizeGeometry({ kind: geometryTool, points: [creationStart, [p.x, p.y]] }); onGeometryCreate?.(g); setCreationStart(null) } catch (error) { onInvalid?.(error.message) } }
+        return
+      }
+      const chosen = layers.find(layer => layer.id === selectedId)
+      // Selected handles win over a curve crossing an endpoint.
+      const selectedHit = hitSegmentsRef.current.find(item => item.id === selectedId)
+      const handle = geometryTool === 'select' && chosen && isGeometry(chosen) && !chosen.locked ? selectedHit?.handles?.findIndex(point => Math.hypot(point[0] - position.px, point[1] - position.py) <= 9) ?? -1 : -1
+      const hit = hitLayer(position)
+      const layer = ['rotate', 'scale'].includes(geometryTool) ? chosen : handle >= 0 ? chosen : layers.find(layer => layer.id === hit?.id)
+      if (isGeometry(layer)) {
+        onSelectLayer?.(layer.id)
+        if (layer.locked) return
+        const pivot = geometryCenter(layer.geometry)
+        if (geometryTool !== 'select' && Math.hypot(p.x - pivot[0], p.y - pivot[1]) < 1e-6) { onInvalid?.('请从对象中心之外开始拖动'); return }
+        dragRef.current = { pointerId: event.pointerId, origin: position, world: p, view: currentView, moved: false, geometry: layer.geometry, id: layer.id, handle, tool: geometryTool, pivot }
+        event.currentTarget.setPointerCapture?.(event.pointerId); return
+      }
+      if (geometryTool !== 'select') { onInvalid?.('请先选择一个未锁定的几何对象'); return }
+    }
     dragRef.current = { pointerId: event.pointerId, origin: position, view: currentView, moved: false, box: event.button === 0 && (boxZoom || event.shiftKey) }
     if (dragRef.current.box) setSelectionBox({ start: position, end: position })
     event.currentTarget.setPointerCapture?.(event.pointerId)
@@ -454,6 +501,22 @@ export default function Plot2D({
     const dy = position.py - drag.origin.py
     if (Math.hypot(dx, dy) > 3) drag.moved = true
     if (!drag.moved) return
+    if (drag.geometry) {
+      const p = worldPosition(position)
+      try {
+        let geometry
+        if (drag.tool === 'rotate') {
+          const angle = (Math.atan2(p.y - drag.pivot[1], p.x - drag.pivot[0]) - Math.atan2(drag.world.y - drag.pivot[1], drag.world.x - drag.pivot[0])) * 180 / Math.PI
+          geometry = transformGeometry(drag.geometry, { kind: 'rotate', angle, pivot: drag.pivot })
+        } else if (drag.tool === 'scale') {
+          const factor = Math.hypot(p.x - drag.pivot[0], p.y - drag.pivot[1]) / Math.hypot(drag.world.x - drag.pivot[0], drag.world.y - drag.pivot[1])
+          geometry = transformGeometry(drag.geometry, { kind: 'scale', factor, pivot: drag.pivot })
+        } else if (drag.handle >= 0) geometry = normalizeGeometry({ ...drag.geometry, points: drag.geometry.points.map((point, i) => i === drag.handle ? [p.x, p.y] : point) })
+        else geometry = transformGeometry(drag.geometry, { kind: 'translate', dx: p.x - drag.world.x, dy: p.y - drag.world.y })
+        drag.preview = geometry; setGeometryPreview({ id: drag.id, geometry })
+      } catch { /* Retain the last valid preview while the pointer crosses a degenerate position. */ }
+      return
+    }
     if (drag.box) { setSelectionBox({ start: drag.origin, end: { px: Math.max(0, Math.min(size.width, position.px)), py: Math.max(0, Math.min(size.height, position.py)) } }); return }
     const shiftX = dx * (drag.view.xmax - drag.view.xmin) / size.width
     const shiftY = dy * (drag.view.ymax - drag.view.ymin) / size.height
@@ -469,7 +532,11 @@ export default function Plot2D({
     const drag = dragRef.current
     if (!drag || (event.pointerId != null && drag.pointerId !== event.pointerId)) return
     dragRef.current = null
-    if (!cancelled && drag.box && drag.moved) {
+    if (drag.geometry) {
+      if (!cancelled && drag.moved && drag.preview) onGeometryChange?.(drag.id, drag.preview)
+      setGeometryPreview(null)
+      if (!cancelled && drag.tool !== 'select') onToolCancel?.()
+    } else if (!cancelled && drag.box && drag.moved) {
       const end = pointerPosition(event)
       if (end) {
         end.px = Math.max(0, Math.min(size.width, end.px)); end.py = Math.max(0, Math.min(size.height, end.py))
@@ -486,11 +553,15 @@ export default function Plot2D({
     }
     setSelectionBox(null)
     onHistoryEnd?.()
-    if (event.currentTarget?.hasPointerCapture?.(drag.pointerId)) event.currentTarget.releasePointerCapture(drag.pointerId)
+    const target = event.currentTarget || localCanvasRef.current
+    if (target?.hasPointerCapture?.(drag.pointerId)) target.releasePointerCapture(drag.pointerId)
   }
 
   const cancelRef = useRef(null)
-  cancelRef.current = () => finishDrag({}, true)
+  cancelRef.current = () => { finishDrag({}, true); setCreationStart(null) }
+  useEffect(() => {
+    if (localCanvasRef.current) localCanvasRef.current.cancelGeometry = () => { if (dragRef.current?.geometry) cancelRef.current?.(); setCreationStart(null) }
+  }, [])
   useEffect(() => {
     const cancel = () => cancelRef.current?.()
     window.addEventListener('blur', cancel)
@@ -499,7 +570,7 @@ export default function Plot2D({
 
   const handleKeyDown = (event) => {
     const key = event.key
-    if (key === 'Escape') { finishDrag({}, true); onBoxComplete?.(); return }
+    if (key === 'Escape') { event.preventDefault(); finishDrag({}, true); setCreationStart(null); onToolCancel?.(); onBoxComplete?.(); return }
     if (event.altKey || event.ctrlKey || event.metaKey) return
     if (!['+', '=', '-', '_', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key)) return
     event.preventDefault()
@@ -520,6 +591,7 @@ export default function Plot2D({
   contextCallbackRef.current = { wheel: handleWheel, onInteractionStart, open: location => {
     const position = pointerPosition(location)
     if (!position || !size.width || !size.height) return
+    finishDrag({}, true); setCreationStart(null); onToolCancel?.()
     const hit = hitLayer(position)
     onContextMenu?.({ ...location, source: '2d', layerId: hit?.id,
       point: worldPosition(position), anchorElement: localCanvasRef.current })
@@ -539,9 +611,9 @@ export default function Plot2D({
     <div className={`plot2d ${dark ? 'plot2d--dark' : ''}`} ref={wrapperRef}>
       <canvas
         ref={attachCanvas}
-        className={`plot2d__canvas ${boxZoom ? 'box-zoom' : ''}`} data-view={JSON.stringify(currentView)}
+        className={`plot2d__canvas ${boxZoom || geometryTool !== 'select' ? 'box-zoom' : ''}`} data-view={JSON.stringify(currentView)}
         role="img"
-        aria-label="二维坐标画布。使用滚轮缩放，拖动画布平移，方向键移动视图。"
+        aria-label="二维坐标画布。使用工具放置几何对象，拖动对象或控制点编辑，Esc 取消；滚轮缩放，空白处拖动平移。"
         tabIndex={0}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}

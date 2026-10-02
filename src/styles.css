@@ -284,3 +284,24 @@ input:disabled, textarea:disabled, select:disabled { opacity: .6; cursor: not-al
 .probe-marker[hidden] { display: none; }
 
 .layer-lock-controls button, .view-settings-heading button, .box-mode-hint button, .probe-readout button { border: 0; }
+
+.geometry-toolbar { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 5px; padding: 8px 19px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.geometry-toolbar button, .geometry-actions button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-alt); color: var(--text); font-size: 11px; }
+.geometry-toolbar button.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.geometry-toolbar span { margin-left: 9px; color: var(--muted); font-size: 10px; }
+.geometry-point + .geometry-point { margin-top: 12px; }
+.geometry-point strong { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11px; }
+.geometry-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.geometry-fields label, .geometry-text, .export-fields > label { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+.geometry-fields input, .export-fields input[type=number], .export-fields select { width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-alt); color: var(--text); font-variant-numeric: tabular-nums; }
+.geometry-text { margin-top: 14px; margin-bottom: 12px; }
+.geometry-text textarea { width: 100%; min-height: 65px; padding: 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-alt); color: var(--text); resize: vertical; }
+.geometry-transform fieldset { padding: 0; margin: 0; border: 0; min-width: 0; }
+.geometry-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.geometry-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.export-fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 10px; }
+.export-fields > label { flex: 1 1 90px; }
+.export-fields > .check-field { display: flex; align-self: center; }
+.geometry-fields input:focus-visible, .geometry-text textarea:focus-visible, .geometry-actions button:focus-visible, .geometry-toolbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.geometry-reflection { margin-top: 10px; color: var(--muted); font-size: 11px; }

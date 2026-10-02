@@ -4,7 +4,13 @@ import Plot3D from './components/Plot3D.jsx';
 import ContextMenu from './components/ContextMenu.jsx';
 import LayerNameEditor from './components/LayerNameEditor.jsx';
 import ViewSettings from './components/ViewSettings.jsx';
-import { START_VIEW, DEFAULT_BOX, validView, equalAspect, normalizeStyle, normalizeBox, normalizeProbes, probeSignature } from './math/view.js';
+import GeometryCreator from './components/GeometryCreator.jsx';
+import GeometryEditor from './components/GeometryEditor.jsx';
+import ExportSettings from './components/ExportSettings.jsx';
+import { isGeometry, normalizeGeometry, GEOMETRY_NAMES, geometrySummary, transformGeometry } from './math/geometry.js';
+import { normalizeProject } from './math/project.js';
+import { GEOMETRY_EXAMPLES } from './math/geometryExamples.js';
+import { START_VIEW, DEFAULT_BOX, validView, equalAspect, normalizeStyle, normalizeBox, probeSignature } from './math/view.js';
 import { createHistory, recordHistory, finishGroup } from './interaction/history.js';
 import { compile, findParameters, parsePlot } from './math/engine.js';
 import { domainPair, normalizeDomain, withSurfaceAxis } from './math/domain.js';
@@ -60,12 +66,16 @@ const EXAMPLES = [
     concept: 'x 和 y 在圆上运动时，z 随 t 增大，形成螺旋。',
     layers: [{ name: '螺旋线', expression: 'x(t)=2*cos(t); y(t)=2*sin(t); z(t)=0.2*t', color: COLORS[2], domain: [0, 8 * Math.PI] }],
     params: {}, ranges: {}, view: { ...START_VIEW }, mode: '3d'
-  }
+  },
+  ...GEOMETRY_EXAMPLES
 ];
 
 function makeLayer(partial, index = 0) {
+  if (partial.geometry) return { id: crypto.randomUUID(), name: partial.name || GEOMETRY_NAMES[partial.geometry.kind],
+    type: 'geometry', geometry: normalizeGeometry(partial.geometry), color: partial.color || COLORS[index % COLORS.length],
+    visible: true, ...normalizeStyle(partial) };
   return {
-    id: crypto.randomUUID(), name: partial.name || `图层 ${index + 1}`,
+    type: 'expression', id: crypto.randomUUID(), name: partial.name || `图层 ${index + 1}`,
     expression: partial.expression || 'y = sin(x)',
     lastValidExpression: partial.expression || 'y = sin(x)',
     color: partial.color || COLORS[index % COLORS.length], visible: true, ...normalizeStyle(partial),
@@ -75,75 +85,15 @@ function makeLayer(partial, index = 0) {
 
 function projectFromExample(example) {
   return {
-    schemaVersion: 1, name: example.title, exampleId: example.id,
+    schemaVersion: 2, name: example.title, exampleId: example.id,
     layers: example.layers.map((layer, index) => makeLayer(layer, index)),
     params: { ...example.params }, ranges: { ...example.ranges },
-    view2d: { ...example.view }, aspectLocked: false, box3d: normalizeBox(), probes: {}, mode: example.mode,
+    view2d: { ...example.view }, aspectLocked: example.aspectLocked === true, box3d: normalizeBox(), probes: {}, mode: example.mode,
     coordinateSystem: example.coordinateSystem || 'cartesian',
     createdAt: new Date().toISOString()
   };
 }
 
-function normalizeProject(data) {
-  if (!data || typeof data !== 'object' || data.schemaVersion !== 1 || !Array.isArray(data.layers) || data.layers.length > 200) {
-    throw new Error('工程格式不受支持');
-  }
-  const layers = data.layers.map((layer, index) => {
-    if (!layer || typeof layer !== 'object' || typeof layer.expression !== 'string' || layer.expression.length > 5000) {
-      throw new Error(`第 ${index + 1} 个图层无效`);
-    }
-    const parsed = parsePlot(layer.expression);
-    const plotKind = parsed.error ? parsePlot(layer.lastValidExpression || layer.expression).kind : parsed.kind;
-    const domain = normalizeDomain(layer.domain, plotKind);
-    return {
-      id: typeof layer.id === 'string' && layer.id ? layer.id : crypto.randomUUID(),
-      name: typeof layer.name === 'string' ? layer.name.slice(0, 100) : `图层 ${index + 1}`,
-      expression: layer.expression,
-      lastValidExpression: typeof layer.lastValidExpression === 'string' ? layer.lastValidExpression : layer.expression,
-      color: typeof layer.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(layer.color) ? layer.color : COLORS[index % COLORS.length],
-      visible: layer.visible !== false, ...normalizeStyle(layer),
-      domain
-    };
-  });
-  const params = {};
-  if (data.params && typeof data.params === 'object' && !Array.isArray(data.params)) {
-    for (const [key, value] of Object.entries(data.params)) {
-      if (/^[A-Za-z][A-Za-z0-9_]{0,30}$/.test(key) && Number.isFinite(value)) params[key] = value;
-    }
-  }
-  const ranges = {};
-  if (data.ranges && typeof data.ranges === 'object' && !Array.isArray(data.ranges)) {
-    for (const [key, range] of Object.entries(data.ranges)) {
-      if (Array.isArray(range) && range.length === 3 && range.every(Number.isFinite) && range[1] > range[0] && range[2] > 0) ranges[key] = range;
-    }
-  }
-  for (const layer of layers) {
-    try {
-      for (const key of findParameters(layer.expression)) {
-        if (!Number.isFinite(params[key])) params[key] = 1;
-        if (!ranges[key]) ranges[key] = [-5, 5, 0.1];
-      }
-    } catch { /* expression error is shown in the inspector */ }
-  }
-  const view2d = validView(data.view2d) ? data.view2d : { ...START_VIEW };
-  const camera = data.camera3d;
-  const camera3d = camera && ['perspective', 'orthographic'].includes(camera.projection) &&
-    Array.isArray(camera.position) && camera.position.length === 3 && camera.position.every(Number.isFinite) &&
-    Array.isArray(camera.target) && camera.target.length === 3 && camera.target.every(Number.isFinite) &&
-    Number.isFinite(camera.zoom) && camera.zoom > 0
-    ? { projection: camera.projection, position: camera.position, target: camera.target, zoom: camera.zoom } : null;
-  return {
-    schemaVersion: 1,
-    name: typeof data.name === 'string' ? data.name.slice(0, 100) : '未命名工程',
-    exampleId: typeof data.exampleId === 'string' ? data.exampleId : null,
-    layers, params, ranges, view2d, aspectLocked: data.aspectLocked === true,
-    box3d: normalizeBox(data.box3d), probes: normalizeProbes(data.probes, layers),
-    mode: ['2d', '3d', 'split'].includes(data.mode) ? data.mode : '2d',
-    coordinateSystem: data.coordinateSystem === 'polar' ? 'polar' : 'cartesian',
-    createdAt: typeof data.createdAt === 'string' ? data.createdAt : new Date().toISOString(),
-    camera3d
-  };
-}
 
 function loadRecoveries() {
   try {
@@ -162,6 +112,7 @@ function safeLoadProject() {
 
 function readPlot(layer) {
   try {
+    if (isGeometry(layer)) { normalizeGeometry(layer.geometry); return { plot: { kind: 'geometry2d' } }; }
     const plot = parsePlot(layer.expression);
     if (plot.error) return { error: plot.error };
     for (const expression of Object.values(plot.formulas || {})) compile(expression);
@@ -236,6 +187,7 @@ function getFitView(layers, params, fallback) {
   const points = [];
   for (const layer of layers) {
     if (!layer.visible) continue;
+    if (isGeometry(layer)) { points.push(...layer.geometry.points); continue; }
     try {
       const plot = parsePlot(layer.lastValidExpression || layer.expression);
       const formulas = plot.formulas || {};
@@ -295,6 +247,9 @@ export default function App() {
   const [activeView, setActiveView] = useState('2d');
   const [showViewSettings, setShowViewSettings] = useState(false);
   const [boxZoom, setBoxZoom] = useState(false);
+  const [geometryTool, setGeometryTool] = useState('select');
+  const [showGeometryCreator, setShowGeometryCreator] = useState(false);
+  const [showExportSettings, setShowExportSettings] = useState(false);
   const [threeAvailable, setThreeAvailable] = useState(true);
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 });
   const history = useRef(createHistory());
@@ -310,7 +265,7 @@ export default function App() {
   const activeCanvas = project.mode === 'split' ? activeView : project.mode;
   const displayedView = useMemo(() => equalAspect(project.view2d, plotSize, project.aspectLocked), [project.view2d, plotSize, project.aspectLocked]);
   const endHistoryGroup = useCallback(() => finishGroup(history.current), []);
-  const flushView = useCallback(() => plot3dRef.current?.flushView?.(), []);
+  const flushView = useCallback(() => { plot2dRef.current?.cancelGeometry?.(); plot3dRef.current?.flushView?.(); }, []);
   const resolveView = useCallback(target => target === '2d' || target === '3d' ? target : activeCanvas, [activeCanvas]);
 
   const selectLayer = useCallback(id => {
@@ -345,7 +300,7 @@ export default function App() {
     ? parsedFormula.kind
     : selectedLayer?.lastValidExpression ? parsePlot(selectedLayer.lastValidExpression).kind
       : project.mode === '3d' ? 'surface3d' : project.coordinateSystem === 'polar' ? 'polar2d' : 'function2d';
-  const formulaGuide = FORMULA_GUIDES[formulaKind];
+  const formulaGuide = FORMULA_GUIDES[formulaKind] || FORMULA_GUIDES.function2d;
   const currentExample = EXAMPLES.find(example => example.id === project.exampleId);
   const selectedParams = useMemo(() => {
     try { return selectedLayer ? findParameters(selectedLayer.expression) : []; } catch { return []; }
@@ -359,8 +314,8 @@ export default function App() {
     for (const layer of renderLayers) {
       if (!layer.visible) continue;
       try {
-        const kind = parsePlot(layer.expression).kind;
-        if (kind === 'function2d' || kind === 'polar2d' || kind === 'parametric2d') has2dLayer = true;
+        const kind = isGeometry(layer) ? 'geometry2d' : parsePlot(layer.expression).kind;
+        if (kind === 'geometry2d' || kind === 'function2d' || kind === 'polar2d' || kind === 'parametric2d') has2dLayer = true;
         if (kind === 'surface3d' || kind === 'curve3d') has3dLayer = true;
       } catch { /* invalid layer is handled by the inspector */ }
     }
@@ -401,7 +356,7 @@ export default function App() {
   const undo = useCallback(() => {
     flushView(); endHistoryGroup();
     if (!history.current.past.length) return;
-    closeContextMenu(); setRenamingId(null);
+    closeContextMenu(); setRenamingId(null); setGeometryTool('select');
     history.current.future.push({ project: projectRef.current, selectedId: selectedRef.current });
     const next = history.current.past.pop();
     recordNavigation(projectRef.current, next.project);
@@ -415,7 +370,7 @@ export default function App() {
   const redo = useCallback(() => {
     flushView(); endHistoryGroup();
     if (!history.current.future.length) return;
-    closeContextMenu(); setRenamingId(null);
+    closeContextMenu(); setRenamingId(null); setGeometryTool('select');
     history.current.past.push({ project: projectRef.current, selectedId: selectedRef.current });
     const next = history.current.future.pop();
     recordNavigation(projectRef.current, next.project);
@@ -489,7 +444,7 @@ export default function App() {
     closeContextMenu(); setRenamingId(null);
     history.current = createHistory();
     navigation.current = { '2d': { past: [], future: [] }, '3d': { past: [], future: [] } };
-    setBoxZoom(false); setShowViewSettings(false);
+    setBoxZoom(false); setShowViewSettings(false); setGeometryTool('select'); setShowExportSettings(false); setShowGeometryCreator(false);
     revisionRef.current += 1;
     projectRef.current = next;
     setProject(next);
@@ -510,12 +465,14 @@ export default function App() {
     commit(previous => {
       const original = previous.layers.find(layer => layer.id === id);
       if (original?.locked && Object.keys(changes).some(key => !['locked', 'visible'].includes(key))) return previous;
+      if (original && changes.geometry && JSON.stringify(original.geometry) === JSON.stringify(changes.geometry) && Object.keys(changes).length === 1) return previous;
       if (!original || Object.entries(changes).every(([key, value]) => original[key] === value)) return previous;
       const params = { ...previous.params };
       const ranges = { ...previous.ranges };
       const layers = previous.layers.map(layer => {
       if (layer.id !== id) return layer;
       const next = { ...layer, ...changes };
+      if (isGeometry(next)) next.geometry = normalizeGeometry(next.geometry);
       if (Object.prototype.hasOwnProperty.call(changes, 'expression') && !readPlot(next).error) {
         const previousKind = parsePlot(layer.lastValidExpression || layer.expression).kind;
         const nextKind = parsePlot(changes.expression).kind;
@@ -542,6 +499,21 @@ export default function App() {
     setSidebarTab('layers');
   }, [commit, resolveView, project.layers.length, notify]);
 
+  const addGeometry = useCallback(geometry => {
+    if (projectRef.current.layers.length >= 200) { notify('一个工程最多支持 200 个图层'); return; }
+    try {
+      const layer = makeLayer({ geometry, name: `新${GEOMETRY_NAMES[geometry.kind]}` }, projectRef.current.layers.length);
+      commit(previous => ({ ...previous, exampleId: null, aspectLocked: previous.aspectLocked || !previous.layers.some(isGeometry), layers: [...previous.layers, layer] }), layer.id);
+      setGeometryTool('select'); setSidebarTab('layers'); setShowRight(true);
+    } catch (error) { notify(error.message); }
+  }, [commit, notify]);
+
+  const chooseGeometryTool = tool => {
+    setBoxZoom(false); setShowGeometryCreator(false); setGeometryTool(tool); setActiveView('2d');
+    if (project.mode === '3d') commit(previous => ({ ...previous, mode: '2d' }));
+    plot2dRef.current?.focus();
+  };
+
   const removeLayer = useCallback(id => {
     const layers = projectRef.current.layers;
     const index = layers.findIndex(layer => layer.id === id);
@@ -557,7 +529,7 @@ export default function App() {
     if (layers.length >= 200) { notify('一个工程最多支持 200 个图层'); return; }
     const copy = { ...structuredClone(layers[index]), id: crypto.randomUUID(), locked: false, name: `${layers[index].name.slice(0, 96)} 副本` };
     commit(previous => ({ ...previous, exampleId: null, layers: [...previous.layers.slice(0, index + 1), copy, ...previous.layers.slice(index + 1)] }), copy.id);
-    notify('图层已复制；同名参数仍联动');
+    notify(isGeometry(layers[index]) ? '几何对象已复制' : '图层已复制；同名参数仍联动');
   }, [commit, notify]);
 
   const moveLayer = useCallback((id, direction) => {
@@ -574,7 +546,7 @@ export default function App() {
   const editLayer = useCallback(id => {
     if (projectRef.current.layers.find(layer => layer.id === id)?.locked) { notify('请先解锁图层，再修改属性'); return; }
     selectLayer(id); setShowRight(true);
-    window.requestAnimationFrame(() => { const input = document.getElementById('expression-input'); input?.focus(); input?.select(); });
+    window.requestAnimationFrame(() => { const input = document.getElementById('expression-input') || document.querySelector('.geometry-editor input'); input?.focus(); input?.select(); });
   }, [selectLayer, notify]);
 
   const changeParameter = useCallback((key, value) => {
@@ -635,13 +607,15 @@ export default function App() {
     } catch (error) { notify(`恢复失败：${error.message}`); }
   }, [switchProject, notify]);
 
-  const exportPng = useCallback(async target => {
+  const exportPng = useCallback(async (target, options) => {
     const view = resolveView(target);
+    if (view === '3d' && !threeAvailable) { notify('3D 绘制暂不可用，请切换到二维画布'); return; }
     if (staleInView(view)) { notify('请先修正当前画布的表达式，再导出图像'); return; }
     const canvas = view === '3d' ? plot3dRef.current : plot2dRef.current;
     if (!canvas) { notify('当前视图尚未准备好'); return; }
     try {
-      const dataUrl = canvas.toDataURL('image/png');
+      const exportOptions = options || (view === '2d' && projectRef.current.layers.some(isGeometry) ? { width: Math.max(64, canvas.clientWidth), height: Math.max(64, canvas.clientHeight), scale: canvas.width / canvas.clientWidth } : null);
+      const dataUrl = exportOptions ? canvas.exportPng(exportOptions) : canvas.toDataURL('image/png');
       if (window.desktop) {
         const result = await window.desktop.savePng(dataUrl, project.name);
         if (!result) return;
@@ -653,7 +627,7 @@ export default function App() {
       }
       notify(`已导出 ${view.toUpperCase()} 画布 PNG`);
     } catch (error) { notify(`导出失败：${error.message}`); }
-  }, [staleInView, resolveView, project.name, notify]);
+  }, [staleInView, resolveView, project.name, notify, threeAvailable]);
 
   const zoom2d = useCallback(factor => {
     const view = equalAspect(projectRef.current.view2d, plotSize, projectRef.current.aspectLocked);
@@ -739,7 +713,7 @@ export default function App() {
     const separator = () => menuItems.push({ separator: true });
     if (menuLayer) {
       menuItems.push(
-        item('edit', '编辑表达式', () => editLayer(menuLayer.id), menuLayer.locked, '请先解锁'),
+        item('edit', isGeometry(menuLayer) ? '编辑坐标与变换' : '编辑表达式', () => editLayer(menuLayer.id), menuLayer.locked, '请先解锁'),
         item('rename', '重命名', () => { setSidebarTab('layers'); setRenamingId(menuLayer.id); }, menuLayer.locked, '请先解锁'),
         item('duplicate', '复制图层', () => duplicateLayer(menuLayer.id), project.layers.length >= 200, '已达 200 层'),
         item('lock', menuLayer.locked ? '解锁图层' : '锁定图层', () => { updateLayer(menuLayer.id, { locked: !menuLayer.locked }); notify(menuLayer.locked ? '图层已解锁' : '图层已锁定；共享参数仍联动'); }),
@@ -751,7 +725,18 @@ export default function App() {
         item('move-down', '下移一层', () => moveLayer(menuLayer.id, 1), index === project.layers.length - 1 || menuLayer.locked || project.layers[index + 1]?.locked, menuLayer.locked || project.layers[index + 1]?.locked ? '图层已锁定' : '已在最下方'),
         item('delete', '删除图层', () => removeLayer(menuLayer.id), menuLayer.locked, '请先解锁', true),
       );
+      if (isGeometry(menuLayer)) {
+        separator();
+        for (const [kind, label] of [['rotate', '拖动旋转'], ['scale', '拖动缩放']]) menuItems.push(item(kind, label, () => chooseGeometryTool(kind), menuLayer.locked, '请先解锁'));
+        for (const [kind, label] of [['mirrorX', '沿 X 轴镜像'], ['mirrorY', '沿 Y 轴镜像']]) menuItems.push(item(kind, label, () => updateLayer(menuLayer.id, { geometry: transformGeometry(menuLayer.geometry, { kind }) }), menuLayer.locked, '请先解锁'));
+      }
     } else {
+      if (view === '2d') {
+        for (const [kind, name] of Object.entries(GEOMETRY_NAMES)) menuItems.push(item(`add-${kind}`, kind === 'point' || kind === 'text' ? `在此处添加${name}` : `绘制${name}`, () => {
+          if (kind === 'point' || kind === 'text') { const point = contextMenu.point || { x: 0, y: 0 }; addGeometry({ kind, points: [[point.x, point.y]], ...(kind === 'text' ? { text: '文字标注', fontSize: 16, rotation: 0 } : {}) }); }
+          else chooseGeometryTool(kind);
+        }, project.layers.length >= 200, '已达 200 层'));
+      }
       menuItems.push(item('add', view === '3d' ? '添加三维表达式' : '添加二维表达式', () => addLayer(view), project.layers.length >= 200, '已达 200 层'));
       separator();
       menuItems.push(
@@ -771,7 +756,7 @@ export default function App() {
       if (view === '3d' && contextMenu.point) menuItems.push(item('focus', '聚焦此处', () => send3dCommand('focus', contextMenu.point), stale, '请先修正表达式'));
       menuItems.push(item('view-settings', '精确视图设置', () => setShowViewSettings(true), unavailable, '3D 不可用'));
       menuItems.push(item('view-back', '返回上一视图', () => travelView('back', view), !navigation.current[view].past.length || unavailable, unavailable ? '3D 不可用' : '没有上一视图'));
-      if (view === '2d') menuItems.push(item('box-zoom', '框选放大', () => { setBoxZoom(true); notify('拖出矩形放大；按 Esc 退出'); }));
+      if (view === '2d') menuItems.push(item('box-zoom', '框选放大', () => { setGeometryTool('select'); setBoxZoom(true); notify('拖出矩形放大；按 Esc 退出'); }));
       if (contextMenu.point) menuItems.push(item('pin-probe', '固定此处坐标探针', () => pinProbe(view, contextMenu.point, contextMenu.layerId), stale || unavailable, '请先修正表达式'));
       if (contextMenu.point) menuItems.push(item('copy-coordinates', view === '3d' ? '复制近似命中点坐标' : '复制画布坐标', () => copyCoordinates(contextMenu.point), stale, '请先修正表达式'));
       menuItems.push(item('export', '导出当前画布 PNG', () => exportPng(view), stale || unavailable, unavailable ? '3D 不可用' : '请先修正表达式'));
@@ -822,7 +807,7 @@ export default function App() {
         <span className="action-separator" />
         <button className="text-button" aria-label="打开工程" onClick={openProject}><Icon name="folder" />打开</button>
         <button className="text-button" aria-label="保存工程" onClick={() => saveProject()}><Icon name="save" />保存</button>
-        <button className="primary-button" onClick={exportPng}><Icon name="download" />导出 PNG</button>
+        <button className="text-button" aria-label="PNG 导出设置" onClick={() => setShowExportSettings(value => !value)}>导出设置</button><button className="primary-button" onClick={exportPng}><Icon name="download" />导出 PNG</button>
       </div>
     </header>
 
@@ -845,14 +830,14 @@ export default function App() {
               <div className="layer-main">{renamingId === layer.id ? <LayerNameEditor name={layer.name} onFinish={name => {
                 setRenamingId(null); updateLayer(layer.id, { name });
                 window.requestAnimationFrame(() => [...document.querySelectorAll('[data-layer-id]')].find(row => row.dataset.layerId === layer.id)?.focus());
-              }} /> : <strong>{layer.name}{layer.locked && <span className="layer-lock" title="已锁定"><Icon name="lock" size={12} /></span>}</strong>}<small>{layer.expression}</small></div>
+              }} /> : <strong>{layer.name}{layer.locked && <span className="layer-lock" title="已锁定"><Icon name="lock" size={12} /></span>}</strong>}<small>{isGeometry(layer) ? geometrySummary(layer.geometry) : layer.expression}</small></div>
               <button className="layer-visibility" title={layer.visible ? '隐藏图层' : '显示图层'} aria-label={layer.visible ? '隐藏图层' : '显示图层'} onClick={event => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}><Icon name={layer.visible ? 'eye' : 'eyeOff'} size={16} /></button>
             </div>;
           })}</div>
           <button className="add-layer" onClick={addLayer}><Icon name="plus" size={17} />添加表达式</button>
           <div className="sidebar-note"><span className="note-icon">✦</span><div><strong>从图形开始理解</strong><p>试着改变一个参数，再观察曲线如何移动。</p></div></div>
         </div> : <div className="sidebar-body examples-body"><p className="sidebar-intro">打开一个示例，拖动参数，看看数学如何变成图形。</p>{EXAMPLES.map(example => <button key={example.id} className={`example-card ${project.exampleId === example.id ? 'current' : ''}`} onClick={() => loadExample(example)}><span className="example-symbol">{example.symbol}</span><span><strong>{example.title}</strong><small>{example.group}</small></span><Icon name="chevron" size={15} /></button>)}{recoveryItems.length > 0 && <div className="recovery-list"><div className="section-line">未保存工程的恢复副本</div>{recoveryItems.map(item => <button key={item.savedAt} className="recovery-card" onClick={() => restoreRecovery(item)}><strong>{item.project?.name || '未命名工程'}</strong><small>{new Date(item.savedAt).toLocaleString('zh-CN')}</small></button>)}</div>}</div>}
-        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.3</span></div>
+        <div className="sidebar-footer"><span className="local-dot" />仅保存于本机<span className="footer-version">v0.1.4</span></div>
       </aside>
 
       <main className="main-area">
@@ -860,17 +845,24 @@ export default function App() {
           {activeCanvas === '2d' && <div className="coord-segment"><span>坐标系</span><select value={project.coordinateSystem || 'cartesian'} onChange={event => commit(previous => ({ ...previous, coordinateSystem: event.target.value }))} aria-label="坐标系"><option value="cartesian">直角坐标</option><option value="polar">极坐标</option></select></div>}
           {activeCanvas === '3d' && <div className="camera-controls"><button onClick={() => send3dCommand('toggleProjection')} title="切换透视／正交投影">{projection}</button><button onClick={() => send3dCommand('top')} title="从上方看">俯视</button><button onClick={() => send3dCommand('front')} title="从前方看">正视</button><button onClick={() => send3dCommand('side')} title="从侧面看">侧视</button></div>}
           <div className="toolbar-spacer" /><div className="toolbar-actions"><IconButton icon="back" label="返回上一视图 Alt+←" onClick={() => travelView('back')} disabled={!navigation.current[activeCanvas].past.length} /><IconButton icon="forward" label="前进下一视图 Alt+→" onClick={() => travelView('forward')} disabled={!navigation.current[activeCanvas].future.length} /><button className={`text-button ${showViewSettings ? 'is-active' : ''}`} aria-expanded={showViewSettings} onClick={() => setShowViewSettings(value => !value)}>视图设置</button><IconButton icon="zoomOut" label="缩小" onClick={() => zoomActive(1.25)} /><IconButton icon="zoomIn" label="放大" onClick={() => zoomActive(0.8)} /><span className="action-separator" /><IconButton icon="fit" label="适配内容 F" onClick={fitView} /><IconButton icon="reset" label="重置视图" onClick={resetView} /><IconButton icon="sliders" label="显示设置面板" onClick={() => setShowRight(value => !value)} className="mobile-settings" /></div></div>
+        {activeCanvas === '2d' && <div className="geometry-toolbar" role="toolbar" aria-label="二维几何工具">
+          {[['select', '选择'], ...Object.entries(GEOMETRY_NAMES)].map(([tool, label]) => <button key={tool} data-tool={tool} aria-pressed={geometryTool === tool} className={geometryTool === tool ? 'active' : ''} onClick={() => chooseGeometryTool(tool)}>{label}</button>)}
+          <button aria-label="用坐标创建" onClick={() => { setGeometryTool('select'); setShowGeometryCreator(value => !value); }}>坐标创建</button><span>{geometryTool === 'select' ? '拖动对象或端点 · 空白处平移' : geometryTool === 'rotate' || geometryTool === 'scale' ? `从对象中心之外拖动${geometryTool === 'rotate' ? '旋转' : '缩放'} · Esc 取消` : geometryTool === 'point' || geometryTool === 'text' ? '单击画布放置 · Esc 取消' : '依次单击两个位置 · Esc 取消'}</span>
+          {geometryTool !== 'select' && <button onClick={() => setGeometryTool('select')}>取消</button>}
+        </div>}
+        {showGeometryCreator && activeCanvas === '2d' && <GeometryCreator onCreate={addGeometry} onClose={() => setShowGeometryCreator(false)} />}
+        {showExportSettings && <ExportSettings key={activeCanvas} target={activeCanvas} canvas={activeCanvas === '3d' ? plot3dRef.current : plot2dRef.current} onExport={exportPng} onClose={() => setShowExportSettings(false)} />}
         {showViewSettings && <ViewSettings key={activeCanvas} target={activeCanvas} view={displayedView} box={project.box3d || DEFAULT_BOX} aspectLocked={project.aspectLocked} onApply={next => { change2dView(next); notify('二维视图范围已应用'); }} onAspect={locked => commit(previous => ({ ...previous, aspectLocked: locked }))} onBox={box => { commit(previous => ({ ...previous, box3d: box })); notify('三维参考坐标盒已更新'); }} onClose={() => setShowViewSettings(false)} />}
         <div className={`canvas-stage mode-${project.mode}`}>
-          {(project.mode === '2d' || project.mode === 'split') && <section className={`plot-panel plot-panel-2d ${activeCanvas === '2d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('2d')} onFocusCapture={() => setActiveView('2d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面{project.mode === 'split' && activeCanvas === '2d' ? ' · 当前' : ''}</span>{staleInView('2d') && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div>{boxZoom && <div className="box-mode-hint">拖出矩形放大 · Esc 退出<button onClick={() => setBoxZoom(false)}>退出</button></div>}<Plot2D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={next => { if (activeCanvas === '2d') setStatus(next); }} view={project.view2d || START_VIEW} onViewChange={change2dView} onHistoryEnd={endHistoryGroup} onSize={setPlotSize} aspectLocked={project.aspectLocked} boxZoom={boxZoom} onBoxComplete={() => setBoxZoom(false)} probe={probes['2d']} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={() => addLayer('2d')}>添加表达式</button></div>}</section>}
+          {(project.mode === '2d' || project.mode === 'split') && <section className={`plot-panel plot-panel-2d ${activeCanvas === '2d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('2d')} onFocusCapture={() => setActiveView('2d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot" />二维平面{project.mode === 'split' && activeCanvas === '2d' ? ' · 当前' : ''}</span>{staleInView('2d') && <span className="stale-chip">上一有效结果 · 请修正表达式</span>}</div>{boxZoom && <div className="box-mode-hint">拖出矩形放大 · Esc 退出<button onClick={() => setBoxZoom(false)}>退出</button></div>}<Plot2D geometryTool={geometryTool} onToolCancel={() => setGeometryTool('select')} onGeometryCreate={addGeometry} onGeometryChange={(id, geometry) => updateLayer(id, { geometry })} onInvalid={notify} layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={next => { if (activeCanvas === '2d') setStatus(next); }} view={project.view2d || START_VIEW} onViewChange={change2dView} onHistoryEnd={endHistoryGroup} onSize={setPlotSize} aspectLocked={project.aspectLocked} boxZoom={boxZoom} onBoxComplete={() => setBoxZoom(false)} probe={probes['2d']} canvasRef={plot2dRef} coordinateSystem={project.coordinateSystem || 'cartesian'} theme={theme} />{!has2dLayer && geometryTool === 'select' && <div className="empty-plot"><span>∿</span><h3>从一个二维表达式开始</h3><p>添加函数，图像会在这里出现。</p><button onClick={() => addLayer('2d')}>添加表达式</button></div>}</section>}
           {(project.mode === '3d' || project.mode === 'split') && <section className={`plot-panel plot-panel-3d ${activeCanvas === '3d' ? 'is-active' : ''}`} onPointerDownCapture={() => setActiveView('3d')} onFocusCapture={() => setActiveView('3d')}><div className="plot-overlay-top"><span className="view-label"><span className="view-label-dot dot-3d" />三维空间{project.mode === 'split' && activeCanvas === '3d' ? ' · 当前' : ''}</span>{staleInView('3d') && <span className="stale-chip">上一有效结果</span>}</div><Plot3D layers={renderLayers} params={project.params} selectedId={selectedId} onSelectLayer={selectLayer} onContextMenu={openContextMenu} onInteractionStart={closeContextMenu} onStatus={next => { if (activeCanvas === '3d') setStatus({ ...next, approximate: !!next.cursor }); }} onAvailabilityChange={setThreeAvailable} box={project.box3d || DEFAULT_BOX} probe={probes['3d']} canvasRef={plot3dRef} theme={theme} viewCommand={viewCommand} cameraState={project.camera3d} onCameraChange={handleCameraChange} />{!has3dLayer && <div className="empty-plot empty-plot-3d"><span>◈</span><h3>让函数进入三维空间</h3><p>打开曲面示例，旋转视角观察高度变化。</p><button onClick={() => addLayer('3d')}>添加三维表达式</button></div>}</section>}
         </div>
         <div className="probe-tray">{renderProbe('2d')}{renderProbe('3d')}</div>
         <div className="statusbar"><div className="status-left"><span className="status-live-dot" />{statusText}</div><div className="status-right"><span>{activeCanvas === '3d' ? '拖动旋转 · 滚轮缩放' : '拖动平移 · 滚轮缩放'}</span><span className="status-divider" /><span>{activeCanvas === '3d' ? '3D' : project.coordinateSystem === 'polar' ? '极坐标' : '直角坐标'}</span><button onClick={() => setShowHelp(true)} title="查看快捷键">?</button></div></div>
       </main>
 
-      <aside className={`right-sidebar ${showRight ? 'show' : ''}`}><div className="inspector-header"><span className="eyebrow">INSPECTOR</span><h2>{selectedLayer ? selectedLayer.name : '属性设置'}</h2><p>修改表达式和参数，观察画布中的变化。</p></div>
-        {selectedLayer ? <div className="inspector-scroll"><div className="layer-lock-controls"><button aria-label={selectedLayer.locked ? '解锁当前图层' : '锁定当前图层'} onClick={() => { updateLayer(selectedLayer.id, { locked: !selectedLayer.locked }); notify(selectedLayer.locked ? '图层已解锁' : '图层已锁定；共享参数仍联动'); }}><Icon name="lock" size={14} />{selectedLayer.locked ? '已锁定 · 点击解锁' : '锁定图层'}</button>{selectedLayer.locked && <p>属性、排序和删除已锁定；仍可选择、显隐和复制。共享参数继续联动。</p>}</div><div className="inspector-section"><div className="field-heading"><label htmlFor="expression-input">表达式</label><button type="button" className={`formula-help-toggle ${showFormulaHelp ? 'is-open' : ''}`} aria-expanded={showFormulaHelp} aria-controls="formula-guide" onClick={() => setShowFormulaHelp(value => !value)}><Icon name="help" size={14} />公式说明</button></div>
+      <aside className={`right-sidebar ${showRight ? 'show' : ''}`}><div className="inspector-header"><span className="eyebrow">INSPECTOR</span><h2>{selectedLayer ? selectedLayer.name : '属性设置'}</h2><p>编辑坐标、表达式或参数，观察画布中的变化。</p></div>
+        {selectedLayer ? <div className="inspector-scroll"><div className="layer-lock-controls"><button aria-label={selectedLayer.locked ? '解锁当前图层' : '锁定当前图层'} onClick={() => { updateLayer(selectedLayer.id, { locked: !selectedLayer.locked }); notify(selectedLayer.locked ? '图层已解锁' : '图层已锁定；共享参数仍联动'); }}><Icon name="lock" size={14} />{selectedLayer.locked ? '已锁定 · 点击解锁' : '锁定图层'}</button>{selectedLayer.locked && <p>属性、排序和删除已锁定；仍可选择、显隐和复制。共享参数继续联动。</p>}</div>{isGeometry(selectedLayer) ? <GeometryEditor key={selectedLayer.id} layer={selectedLayer} onChange={geometry => updateLayer(selectedLayer.id, { geometry })} onInvalid={notify} onDragTool={chooseGeometryTool} /> : <><div className="inspector-section"><div className="field-heading"><label htmlFor="expression-input">表达式</label><button type="button" className={`formula-help-toggle ${showFormulaHelp ? 'is-open' : ''}`} aria-expanded={showFormulaHelp} aria-controls="formula-guide" onClick={() => setShowFormulaHelp(value => !value)}><Icon name="help" size={14} />公式说明</button></div>
           <textarea id="expression-input" className={`expression-input ${selectedValidation?.error ? 'has-error' : ''}`} value={selectedLayer.expression} disabled={selectedLayer.locked} onBlur={endHistoryGroup} onChange={event => updateLayer(selectedLayer.id, { expression: event.target.value }, { group: `expression:${selectedLayer.id}` })} spellCheck={false} rows={selectedLayer.expression.length > 32 ? 3 : 2} />
           <div className="expression-hint">支持 sin、cos、^、π、参数与括号</div>
           {selectedValidation?.error && <div className="field-error" role="alert">{selectedValidation.error}</div>}
@@ -896,8 +888,8 @@ export default function App() {
               <p className="domain-hint">仅绘制此范围内的部分。</p>
             </>}
           </div>
-          <div className="inspector-section"><div className="field-heading"><span>图层样式</span><span className="field-kicker">STYLE</span></div><div className="color-options">{COLORS.map(color => <button key={color} disabled={selectedLayer.locked} className={`color-swatch ${selectedLayer.color === color ? 'selected' : ''}`} style={{ '--swatch': color }} onClick={() => updateLayer(selectedLayer.id, { color })} title={`选择颜色 ${color}`} aria-label={`选择颜色 ${color}`} />)}</div>
-            <div className="style-fields"><label>线宽<input aria-label="图层线宽" type="number" min="1" max="12" step="0.1" value={selectedLayer.lineWidth} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d'} onChange={event => { const n = Number(event.target.value); if (Number.isFinite(n) && n >= 1 && n <= 12) updateLayer(selectedLayer.id, { lineWidth: n }, { group: `width:${selectedLayer.id}` }); }} onBlur={endHistoryGroup} /></label><label>线型<select aria-label="图层线型" value={selectedLayer.lineStyle} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d'} onChange={event => updateLayer(selectedLayer.id, { lineStyle: event.target.value })}><option value="solid">实线</option><option value="dashed">虚线</option><option value="dotted">点线</option></select></label></div>
+          </>}<div className="inspector-section"><div className="field-heading"><span>图层样式</span><span className="field-kicker">STYLE</span></div><div className="color-options">{COLORS.map(color => <button key={color} disabled={selectedLayer.locked} className={`color-swatch ${selectedLayer.color === color ? 'selected' : ''}`} style={{ '--swatch': color }} onClick={() => updateLayer(selectedLayer.id, { color })} title={`选择颜色 ${color}`} aria-label={`选择颜色 ${color}`} />)}</div>
+            <div className="style-fields"><label>线宽<input aria-label="图层线宽" type="number" min="1" max="12" step="0.1" value={selectedLayer.lineWidth} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d' || selectedLayer.geometry?.kind === 'text'} onChange={event => { const n = Number(event.target.value); if (Number.isFinite(n) && n >= 1 && n <= 12) updateLayer(selectedLayer.id, { lineWidth: n }, { group: `width:${selectedLayer.id}` }); }} onBlur={endHistoryGroup} /></label><label>线型<select aria-label="图层线型" value={selectedLayer.lineStyle} disabled={selectedLayer.locked || selectedPlotKind === 'surface3d' || ['point', 'text'].includes(selectedLayer.geometry?.kind)} onChange={event => updateLayer(selectedLayer.id, { lineStyle: event.target.value })}><option value="solid">实线</option><option value="dashed">虚线</option><option value="dotted">点线</option></select></label></div>
             <label className="opacity-field">透明度 <output>{Math.round(selectedLayer.opacity * 100)}%</output><input type="range" aria-label="图层透明度" min="0" max="1" step="0.01" value={selectedLayer.opacity} disabled={selectedLayer.locked} onPointerDown={sliderStart} onPointerUp={sliderEnd} onPointerCancel={sliderEnd} onLostPointerCapture={sliderEnd} onBlur={sliderEnd} onChange={event => updateLayer(selectedLayer.id, { opacity: Number(event.target.value) }, { group: `opacity:${selectedLayer.id}`, hold: sliderHeld.current })} /></label>
             <p className="domain-hint">{selectedPlotKind === 'surface3d' ? '曲面支持颜色与透明度；线宽和线型用于曲线。' : '线宽以屏幕像素计；0% 透明度的图层不会被画布命中。'}</p>
             <button className="delete-layer" disabled={selectedLayer.locked} onClick={() => removeLayer(selectedLayer.id)}><Icon name="trash" size={15} />删除此图层</button></div>
@@ -914,6 +906,6 @@ export default function App() {
         staleInView(contextMenu.source) ? '上一有效结果 · 请先修正表达式' :
         `${contextMenu.keyboard ? '键盘入口 · 画布中心' : contextMenu.source === '3d' ? (contextMenu.point ? '采样命中点' : '视图操作') : '画布位置'}${contextMenu.point ? ' · ' + Object.entries(contextMenu.point).map(([axis, value]) => `${axis} ${contextMenu.source === '3d' ? '≈ ' : ''}${formatNumber(value)}`).join('，') : ''}`} />}
     {toast && <div className="toast" role="status">{toast}</div>}
-    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>右键单击画布或图层打开菜单。在三维画布中，左键拖动旋转、右键拖动平移、滚轮缩放。分屏时，工具栏操作作用于当前画布。视图设置可输入范围、锁定等比例；Shift 拖动可框选放大。右键可固定坐标探针，图形改变后探针会失效。连续输入以停顿或离开输入框为一次撤销，输入框内 Ctrl+Z 保留文本撤销。</p><div className="shortcut-grid"><span>打开操作菜单</span><kbd>Shift + F10</kbd><span>选择 / 执行菜单项</span><kbd>↑ ↓ / Enter</kbd><span>关闭菜单</span><kbd>Esc</kbd><span>视图后退 / 前进</span><kbd>Alt + ← / →</kbd><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
+    {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><div className="help-modal" role="dialog" aria-modal="true" aria-label="快捷键帮助" onMouseDown={event => event.stopPropagation()}><div className="modal-head"><div><span className="eyebrow">GUIDE</span><h2>让探索更顺手</h2></div><button onClick={() => setShowHelp(false)} aria-label="关闭帮助">×</button></div><p>二维工具栏可放置点、线段、直线、向量和文字。拖动几何对象移动，拖动控制点修改坐标；右侧可输入坐标、平移量、角度和倍率。Esc 取消创建或拖动。右键单击画布或图层打开菜单。在三维画布中，左键拖动旋转、右键拖动平移、滚轮缩放。分屏时，工具栏操作作用于当前画布。视图设置可输入范围、锁定等比例；Shift 拖动可框选放大。右键可固定坐标探针，图形改变后探针会失效。连续输入以停顿或离开输入框为一次撤销，输入框内 Ctrl+Z 保留文本撤销。</p><div className="shortcut-grid"><span>打开操作菜单</span><kbd>Shift + F10</kbd><span>选择 / 执行菜单项</span><kbd>↑ ↓ / Enter</kbd><span>关闭菜单</span><kbd>Esc</kbd><span>视图后退 / 前进</span><kbd>Alt + ← / →</kbd><span>保存工程</span><kbd>Ctrl + S</kbd><span>打开工程</span><kbd>Ctrl + O</kbd><span>撤销 / 重做</span><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>适配当前内容</span><kbd>F</kbd><span>放大 / 缩小</span><kbd>+ / −</kbd></div><button className="primary-button modal-close" onClick={() => setShowHelp(false)}>开始探索</button></div></div>}
   </div>;
 }
